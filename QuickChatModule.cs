@@ -8,7 +8,7 @@ namespace Marisa.QuickChat;
 [Module(
     "快聊",
     "通过全局快捷键在鼠标位置呼出磨砂半透明对话框，可快速与已激活桌宠对话。",
-    defaultCategory: "Marisa")]
+    defaultCategory: "Marisa", editorUI: typeof(QuickChatConfigUI))]
 public class QuickChatModule(
     ChatActivitySystem chatActivitySystem,
     PluginSystem pluginSystem,
@@ -44,6 +44,7 @@ public class QuickChatModule(
         return Task.CompletedTask;
     }
 }
+
 
 
 

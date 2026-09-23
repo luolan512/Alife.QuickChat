@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: file: blob:;">
+  <title>QuickChat</title>
+  <link rel="stylesheet" href="style.css?v=202609220029">
+</head>
+<body>
+  <div id="resizeLayer" aria-hidden="true">
+    <div class="resize-handle" data-edge="n"></div>
+    <div class="resize-handle" data-edge="s"></div>
+    <div class="resize-handle" data-edge="w"></div>
+    <div class="resize-handle" data-edge="e"></div>
+    <div class="resize-handle" data-edge="nw"></div>
+    <div class="resize-handle" data-edge="ne"></div>
+    <div class="resize-handle" data-edge="sw"></div>
+    <div class="resize-handle" data-edge="se"></div>
+  </div>
+  <main id="app" data-mode="expanded">
+    <header id="titlebar">
+      <div id="petStrip" aria-label="桌宠列表"></div>
+      <button id="screenshotButton" class="title-button" type="button" title="截取全屏并发送给当前桌宠">📷</button>
+      <button id="regionScreenshotButton" class="title-button" type="button" title="截取区域并发送给当前桌宠">✂️</button>
+      <button id="clearButton" type="button" title="清空快聊显示（不影响原始聊天记录）">清理</button>
+      <button id="minimizeButton" type="button" title="最小化为输入条">▼</button>
+    </header>
+
+    <section id="messageList" aria-live="polite"></section>
+    <section id="imagePreview" aria-label="待发送图片"></section>
+
+    <form id="composer" autocomplete="off">
+      <button id="compactPetName" type="button" title="点击切换桌宠">桌宠</button>
+      <button id="attachButton" type="button" title="添加图片或文件">＋</button>
+      <input id="imageInput" type="file" multiple hidden>
+      <textarea id="input" rows="1" placeholder="输入消息，Enter 发送；可粘贴图片或文件"></textarea>
+      <button id="sendButton" type="submit">发送</button>
+      <button id="restoreButton" type="button" title="显示聊天框">▲</button>
+    </form>
+
+    <div id="confirmOverlay" aria-hidden="true">
+      <div class="confirm-panel" role="dialog" aria-modal="true">
+        <div class="confirm-title">确认清理？</div>
+        <div class="confirm-text">将清空快聊显示，不影响原始聊天记录。</div>
+        <div class="confirm-actions">
+          <button id="confirmCancel" type="button">取消</button>
+          <button id="confirmOk" type="button">清理</button>
+        </div>
+      </div>
+    </div>
+    <div id="dropOverlay" aria-hidden="true">
+      <div class="drop-overlay-panel">
+        <div class="drop-overlay-title">释放以添加</div>
+        <div class="drop-overlay-subtitle">拖到聊天记录直接发送；拖到输入区加入等待区</div>
+      </div>
+    </div>
+  </main>
+
+  <script src="main.js?v=202609220029"></script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+

@@ -49,6 +49,13 @@ public static class QuickChatContentFilter
         return text.Trim();
     }
 
+    static readonly HashSet<string> InjectedMessageSources = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SystemEventService",
+        "SystemEventBoostService",
+        "温柔纸条"
+    };
+
     public static bool IsInjectedSystemMessage(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -57,13 +64,152 @@ public static class QuickChatContentFilter
         if (raw.Contains(Alife.Framework.ChatBot.PokeMessageTag, StringComparison.OrdinalIgnoreCase))
             return true;
 
-        // SystemEventService and other system modules inject source tags. Keep ChatWindow messages,
+        // System modules inject prompts/status through source tags. Keep ChatWindow messages,
         // whose source marker is removed later, but never display module injections as user bubbles.
-        return raw.Contains("[消息来源(SystemEventService)]", StringComparison.OrdinalIgnoreCase)
-            || raw.Contains("消息来源:[SystemEventService]", StringComparison.OrdinalIgnoreCase)
-            || raw.Contains("[来自系统", StringComparison.OrdinalIgnoreCase)
+        if (InjectedMessageSources.Any(source =>
+                raw.Contains("[消息来源(" + source + ")]", StringComparison.OrdinalIgnoreCase) ||
+                raw.Contains("消息来源:[" + source + "]", StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        return raw.Contains("[来自系统", StringComparison.OrdinalIgnoreCase)
             || raw.Contains("[功能说明(", StringComparison.OrdinalIgnoreCase)
             || raw.Contains("[工具文档(", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static string CleanOutgoingDisplayText(string? raw, IEnumerable<string> attachmentPaths)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        string text = raw;
+        foreach (string path in attachmentPaths
+            .Where(item => string.IsNullOrWhiteSpace(item) == false)
+            .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            text = text.Replace(path, "\n", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // QuickChat frontend packages attachments as text labels. The UI renders
+        // structured attachments separately, so strip these labels before display.
+        text = Regex.Replace(
+            text,
+            @"^\s*(?:\[消息来源[^\]]+\]\s*)?用户发送了(?:一张|\d+\s*张)图片\s*[:：]?\s*\r?\n?",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        text = Regex.Replace(
+            text,
+            @"^\s*(?:\[消息来源[^\]]+\]\s*)?用户发送了(?:一个|\d+\s*个)文件\s*[:：]?\s*\r?\n?",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        text = Regex.Replace(
+            text,
+            @"^\s*用户文字\s*[:：]\s*\r?\n?",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.Multiline);
+
+        // Defensive cleanup for older hosts that left a truncated label.
+        text = Regex.Replace(
+            text,
+            @"^\s*用户发送了\s*\r?\n?$",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.Multiline);
+
+        // 多模态请求中的路径元数据只给模型，不应在快聊气泡里展示。
+        // 用状态机而不是跨行正则，避免宿主正则/换行差异把残留带到 UI。
+        string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        System.Collections.Generic.List<string> displayLines = new();
+        bool skippingImageSourceBlock = false;
+        foreach (string sourceLine in lines)
+        {
+            string line = sourceLine.Trim();
+            if (line.StartsWith("图片来源路径", StringComparison.OrdinalIgnoreCase))
+            {
+                skippingImageSourceBlock = true;
+                continue;
+            }
+
+            if (skippingImageSourceBlock)
+            {
+                if (line.StartsWith("- ") || line.StartsWith("-\t") || line.Equals("-", StringComparison.Ordinal))
+                    continue;
+
+                skippingImageSourceBlock = false;
+            }
+
+            displayLines.Add(sourceLine);
+        }
+
+        text = string.Join("\n", displayLines);
+        string cleaned = CleanUserText(text);
+
+        // 附件消息清洗后为空时保留占位符。
+        // 否则 message.Content 为空：主聊天记录里整条消息变成空白，
+        // 快聊 OnChatSent 收到空文本直接早退，图片附件跟着一起丢——
+        // 表现为只有第一条带文字的图片消息能正常显示，后续纯图片消息全部消失。
+        if (string.IsNullOrWhiteSpace(cleaned) == false)
+            return cleaned;
+
+        List<string> paths = attachmentPaths?
+            .Where(item => string.IsNullOrWhiteSpace(item) == false)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList() ?? new List<string>();
+        if (paths.Count == 0)
+            return cleaned;
+
+        int imageCount = paths.Count(item => LooksLikeImagePath(item));
+        return imageCount == paths.Count
+            ? "[图片]"
+            : imageCount == 0 ? "[文件]" : "[图片和文件]";
+    }
+
+    static bool LooksLikeImagePath(string? path) =>
+        Regex.IsMatch(path ?? string.Empty, @"\.(?:png|jpe?g|gif|webp|bmp)$", RegexOptions.IgnoreCase);
+
+    static readonly Regex QuickChatAttachmentMarkerRegex = new(
+        @"\[\s*\[\s*QuickChat(?:Attachment|Image|File)\s*\]\]\s*([\s\S]*?)\[\s*\[\s*/\s*QuickChat(?:Attachment|Image|File)\s*\]\s*\]",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    static readonly Regex QuickChatAttachmentTagRegex = new(
+        @"<\s*QuickChat(?:Attachment|Image|File)\b(?:""[^""]*""|'[^']*'|[^>])*(?:/>|>[\s\S]*?<\s*/\s*QuickChat(?:Attachment|Image|File)\s*>)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    static readonly Regex QuickChatAttachmentAttributeRegex = new(
+        @"\b(?:path|src|url)\s*=\s*(?:""(?<quoted>[^""]*)""|'(?<single>[^']*)'|(?<bare>[^\s/>]+))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public static List<string> ExtractQuickChatAttachmentSources(string? raw, out string text)
+    {
+        text = raw ?? string.Empty;
+        List<string> sources = new();
+
+        foreach (Match match in QuickChatAttachmentMarkerRegex.Matches(text))
+        {
+            string source = match.Groups[1].Value.Trim().Trim('"', '\'', '<', '>');
+            if (string.IsNullOrWhiteSpace(source) == false)
+                sources.Add(source);
+        }
+
+        text = QuickChatAttachmentMarkerRegex.Replace(text, string.Empty);
+
+        foreach (Match match in QuickChatAttachmentTagRegex.Matches(text))
+        {
+            string tag = match.Value;
+            Match attribute = QuickChatAttachmentAttributeRegex.Match(tag);
+            string source = attribute.Success
+                ? attribute.Groups["quoted"].Success
+                    ? attribute.Groups["quoted"].Value
+                    : attribute.Groups["single"].Success
+                        ? attribute.Groups["single"].Value
+                        : attribute.Groups["bare"].Value
+                : Regex.Replace(Regex.Replace(tag, @"<[^>]+>", string.Empty), @"\s+", " ").Trim();
+
+            source = WebUtility.HtmlDecode(source).Trim().Trim('"', '\'', '<', '>');
+            if (string.IsNullOrWhiteSpace(source) == false)
+                sources.Add(source);
+        }
+
+        text = QuickChatAttachmentTagRegex.Replace(text, string.Empty);
+        return sources;
     }
 
     public static string CleanAssistantText(string? raw)
@@ -130,6 +276,7 @@ public static class QuickChatContentFilter
         return text.Trim();
     }
 }
+
 
 
 

@@ -1,4 +1,4 @@
-const { ipcRenderer, shell, webUtils } = require("electron");
+﻿const { ipcRenderer, shell, webUtils } = require("electron");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -22,6 +22,9 @@ const restoreButton = document.getElementById("restoreButton");
 const attachButton = document.getElementById("attachButton");
 const imageInput = document.getElementById("imageInput");
 const imagePreview = document.getElementById("imagePreview");
+const screenshotButton = document.getElementById("screenshotButton");
+const regionScreenshotButton = document.getElementById("regionScreenshotButton");
+let screenshotBusy = false;
 
 const state = {
   pets: [],
@@ -366,10 +369,20 @@ async function sendDroppedImagesNow(files) {
   if (!pet || pendingImages.length === 0)
     return;
 
-  sendMessage("send", { petId: pet.id, text: buildOutgoingText("") });
+  sendMessage("send", { petId: pet.id, text: buildOutgoingText(""), attachmentPaths: pendingImages.map(item => item.path) });
   pendingImages.length = 0;
   renderImagePreview();
   requestResize();
+}
+
+function formatScreenshotTimestamp(date) {
+  const value = date instanceof Date ? date : new Date();
+  const pad = number => String(number).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+}
+
+function screenshotFileTimestamp(date) {
+  return formatScreenshotTimestamp(date).replace(/:/g, "-");
 }
 
 function openImagePath(filePath) {
@@ -720,18 +733,24 @@ function createMessageElement(message) {
   }
 
   const parsedMessage = parseAttachmentMessageText(message.text);
-  const hasAttachments = parsedMessage.images.length > 0 || parsedMessage.files.length > 0;
+  const structuredAttachments = Array.isArray(message.attachments)
+    ? message.attachments.filter(item => item && item.path)
+    : [];
+  const images = [
+    ...structuredAttachments.filter(item => item.kind === "image" || (!item.kind && isImagePath(item.path))),
+    ...parsedMessage.images
+  ];
+  const files = [
+    ...structuredAttachments.filter(item => item.kind !== "image" && (item.kind || isImagePath(item.path) === false)),
+    ...parsedMessage.files
+  ];
+  const hasAttachments = images.length > 0 || files.length > 0;
 
-  if (parsedMessage.images.length > 0) {
+  if (images.length > 0) {
     const imageBox = document.createElement("div");
     imageBox.className = "message-images";
 
-    const imageLabel = document.createElement("div");
-    imageLabel.className = "message-image-label";
-    imageLabel.textContent = "[图片]";
-    imageBox.appendChild(imageLabel);
-
-    for (const image of parsedMessage.images.slice(0, 6)) {
+    for (const image of images.slice(0, 6)) {
       const imageButton = document.createElement("button");
       imageButton.type = "button";
       imageButton.className = "message-image-button";
@@ -750,16 +769,11 @@ function createMessageElement(message) {
     bubble.appendChild(imageBox);
   }
 
-  if (parsedMessage.files.length > 0) {
+  if (files.length > 0) {
     const fileBox = document.createElement("div");
     fileBox.className = "message-files";
 
-    const fileLabel = document.createElement("div");
-    fileLabel.className = "message-image-label";
-    fileLabel.textContent = "[文件]";
-    fileBox.appendChild(fileLabel);
-
-    for (const file of parsedMessage.files.slice(0, 8)) {
+    for (const file of files.slice(0, 8)) {
       const fileButton = document.createElement("button");
       fileButton.type = "button";
       fileButton.className = "message-file-button";
@@ -803,7 +817,7 @@ function messageSignature(messages) {
     showAllMessages: state.showAllMessages,
     messages: visibleMessages.map(message => [
       message.id, message.role, message.petId, message.petName,
-      message.text, message.createdAt
+      message.text, message.createdAt, message.attachments || []
     ])
   });
 }
@@ -957,7 +971,7 @@ function submitInput() {
 
   const outgoingText = buildOutgoingText(text);
 
-  sendMessage("send", { petId: pet.id, text: outgoingText });
+  sendMessage("send", { petId: pet.id, text: outgoingText, attachmentPaths: pendingImages.map(item => item.path) });
   pendingImages.length = 0;
   renderImagePreview();
   input.value = "";
@@ -970,6 +984,15 @@ ipcRenderer.on(channel, (_event, json) => {
   try {
     const payload = JSON.parse(json);
     switch (payload.type) {
+      case "screenshot-failed":
+      case "screenshot-complete":
+        if (screenshotButton)
+          screenshotButton.disabled = false;
+        if (regionScreenshotButton)
+          regionScreenshotButton.disabled = false;
+        screenshotBusy = false;
+        break;
+
       case "state": {
         state.pets = payload.pets || [];
         applyTheme(payload.theme || {});
@@ -1072,6 +1095,29 @@ document.addEventListener("DOMContentLoaded", () => {
     confirmOverlay.classList.remove("visible");
     confirmOverlay.setAttribute("aria-hidden", "true");
   }
+
+  screenshotButton.addEventListener("click", () => {
+    const pet = getSelectedPet();
+    if (!pet || screenshotButton.disabled)
+      return;
+
+    screenshotButton.disabled = true;
+    if (regionScreenshotButton)
+      regionScreenshotButton.disabled = true;
+    screenshotBusy = true;
+    sendMessage("screenshot-request", { petId: pet.id });
+  });
+
+  regionScreenshotButton?.addEventListener("click", () => {
+    const pet = getSelectedPet();
+    if (!pet || regionScreenshotButton.disabled)
+      return;
+
+    screenshotButton.disabled = true;
+    regionScreenshotButton.disabled = true;
+    screenshotBusy = true;
+    sendMessage("screenshot-region-request", { petId: pet.id });
+  });
 
   clearButton.addEventListener("click", () => {
     if (state.selectedId == null)
@@ -1286,3 +1332,4 @@ document.addEventListener("DOMContentLoaded", () => {
   input.focus();
   sendMessage("ready");
 });
+

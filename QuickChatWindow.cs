@@ -5,10 +5,11 @@ using System.Threading.Tasks;
 using ElectronNET.API;
 using ElectronNET.API.Entities;
 using Microsoft.Extensions.Logging;
+using Rectangle = ElectronNET.API.Entities.Rectangle;
 
 namespace Marisa.QuickChat;
 
-public sealed class QuickChatWindow : IDisposable
+public sealed class ElectronQuickChatWindow : IQuickChatWindow
 {
     BrowserWindow? window;
     ManualResizeState? manualResize;
@@ -25,7 +26,7 @@ public sealed class QuickChatWindow : IDisposable
         remove => bridge.OnMessage -= value;
     }
 
-    public QuickChatWindow(ILogger<QuickChatModule> logger)
+    public ElectronQuickChatWindow(ILogger<QuickChatModule> logger)
     {
         this.logger = logger;
         bridge = new QuickChatBridge(logger);
@@ -352,7 +353,7 @@ public sealed class QuickChatWindow : IDisposable
         if (bounds.Width != targetWidth || bounds.Height != height)
             ResizeWindow(targetWidth, height);
     }
-    void ShowAndFocus()
+    public void ShowAndFocus()
     {
         if (window == null)
             return;
@@ -396,6 +397,8 @@ public sealed class QuickChatWindow : IDisposable
         window = null;
     }
 }
+
+
 
 
 

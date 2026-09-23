@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
 
 namespace Marisa.QuickChat;
 
@@ -41,6 +43,11 @@ public class QuickChatConfig
     [DisplayName("标记消息来源")]
     [Description("发送时是否在内部标记消息来源为 QuickChat。不会显示在对话内容中。")]
     public bool MarkMessageSource { get; set; } = true;
+
+    [DisplayName("截图图片输入模式")]
+    [Description("临时分析：图片临时发给模型分析，不保留在主上下文；多模态：图片保留在主上下文；仅路径：只发送路径文本，适合不支持图片的模型。可选值：临时分析、多模态、仅路径。")]
+    [JsonConverter(typeof(StringEnumConverter))]
+    public QuickChatScreenshotImageMode ScreenshotImageMode { get; set; } = QuickChatScreenshotImageMode.多模态;
 
     [DisplayName("基础配色")]
     [Description("可选：自定义、深空、墨黑、雾白、蓝色、青色、绿色、紫色、樱粉、暖橙、透明。选择非自定义时会覆盖下方颜色；要单独调色请改为自定义。")]
@@ -96,4 +103,12 @@ public class QuickChatConfig
     public string TextColor { get; set; } = "#EEF1F6";
 }
 
+
+
+public enum QuickChatScreenshotImageMode
+{
+    临时分析,
+    多模态,
+    仅路径
+}
 
