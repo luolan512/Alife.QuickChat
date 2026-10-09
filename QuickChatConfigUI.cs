@@ -28,9 +28,18 @@ public sealed class QuickChatConfigUI : ComponentBase
 
     QuickChatConfig Config => Configuration as QuickChatConfig ?? new();
 
+    /// <summary>宿主注入的模块实例。配置页靠它问「框架里有哪些角色、哪些会话被删了」。</summary>
+    QuickChatModule? Runtime => Module as QuickChatModule;
+
+    // 「探测」结果缓存一次，供本次渲染的所有控件复用。
+    // 这三个都要读磁盘或运行时状态，不能让每个按钮各查一遍。
+    IReadOnlyList<string> allCharacters = Array.Empty<string>();
+    IReadOnlyList<string> activeCharacters = Array.Empty<string>();
+
     const string InputStyle = "width:100%; min-height:32px; padding:5px 10px; border:1px solid rgba(128,128,128,.35); border-radius:6px; background:transparent; color:inherit; color-scheme:light dark; box-sizing:border-box;";
     const string TextAreaStyle = "width:100%; min-height:86px; padding:8px 10px; border:1px solid rgba(128,128,128,.35); border-radius:6px; background:transparent; color:inherit; color-scheme:light dark; box-sizing:border-box; resize:vertical; font-family:inherit; line-height:1.45;";
     const string ColorPickerStyle = "width:46px; height:32px; padding:2px; border:1px solid rgba(128,128,128,.35); border-radius:6px; background:#fff; cursor:pointer; flex:0 0 auto;";
+    const string ButtonStyle = "padding:7px 16px; border-radius:6px; border:1px solid rgba(128,128,128,.35); background:transparent; color:inherit; cursor:pointer; font-weight:650; font-size:13px;";
 
     protected override void BuildRenderTree(RenderTreeBuilder builder)
     {
@@ -44,14 +53,38 @@ public sealed class QuickChatConfigUI : ComponentBase
             return;
         }
 
+        RefreshProbe();
+
         PropertyInfo[] properties = typeof(QuickChatConfig)
             .GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(item => item.CanRead && item.CanWrite)
+            // 群聊列表需要专门的编辑器（增删行、两个字段），不走通用控件。
+            .Where(item => item.Name != nameof(QuickChatConfig.Groups))
+            // 「流式输出」置顶（排在「启用群聊」上面），接着是群聊那两项。
+            .OrderBy(item => item.Name == nameof(QuickChatConfig.StreamingOutput) ? 0
+                : item.Name == nameof(QuickChatConfig.EnableGroupChat) ? 1
+                : item.Name == nameof(QuickChatConfig.PublicLobbyName) ? 2 : 3)
             .ToArray();
 
         int sequence = 0;
         builder.OpenElement(sequence++, "div");
         builder.AddAttribute(sequence++, "style", "display:flex; flex-direction:column; gap:18px;");
+
+        // 打开窗口：配置页在 Alife 的模块设置里，窗口是 Electron 的独立悬浮窗，
+        // 给一个按钮，省得每次都要记全局快捷键。
+        builder.OpenElement(sequence++, "div");
+        builder.AddAttribute(sequence++, "style", "display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding-bottom:14px; border-bottom:1px solid rgba(128,128,128,.18);");
+        builder.OpenElement(sequence++, "button");
+        builder.AddAttribute(sequence++, "type", "button");
+        builder.AddAttribute(sequence++, "style", ButtonStyle);
+        builder.AddAttribute(sequence++, "onclick", EventCallback.Factory.Create(this, OpenWindow));
+        builder.AddContent(sequence++, "打开快聊窗口");
+        builder.CloseElement();
+        builder.OpenElement(sequence++, "span");
+        builder.AddAttribute(sequence++, "style", "font-size:12px; line-height:1.5; color:rgba(128,128,128,.85);");
+        builder.AddContent(sequence++, "在鼠标附近弹出；也可以直接用上面的全局快捷键。");
+        builder.CloseElement();
+        builder.CloseElement();
 
         foreach (PropertyInfo property in properties)
         {
@@ -78,9 +111,254 @@ public sealed class QuickChatConfigUI : ComponentBase
             }
 
             builder.CloseElement();
+            if (property.Name == nameof(QuickChatConfig.EnableGroupChat))
+                sequence = RenderGroups(builder, sequence, config);
         }
 
         builder.CloseElement();
+    }
+
+    /// <summary>
+    /// 群聊列表编辑器。公共大厅是隐式存在的（名字取「公共大厅名称」），
+    /// 这里只编辑额外的小群，所以不需要「是否公共」这种开关。
+    /// </summary>
+    string managementNote = "";
+    string? pendingDelete;
+    string newGroupName = "";
+    int RenderGroups(RenderTreeBuilder builder, int sequence, QuickChatConfig config)
+    {
+        int seq = sequence;
+        builder.OpenElement(seq++, "details");
+        builder.AddAttribute(seq++, "style", "padding:14px;border:1px solid rgba(128,128,128,.3);border-radius:8px;");
+        builder.OpenElement(seq++, "summary");
+        builder.AddAttribute(seq++, "style", "cursor:pointer;font-weight:650;padding:4px 0;");
+        builder.AddContent(seq++, "小群管理（点击展开）");
+        builder.CloseElement();
+        builder.OpenElement(seq++, "div");
+        builder.AddContent(seq++, "你始终拥有管理权限；建群角色可以拉人、清退和限制群成员，不能清退或限制你。勾选成员可拉人，取消勾选可清退；限制回复会停止该角色在此群的发言。");
+        builder.CloseElement();
+        builder.OpenElement(seq++, "button");
+        builder.AddAttribute(seq++, "type", "button");
+        builder.AddAttribute(seq++, "style", ButtonStyle);
+        builder.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () => InvokeAsync(StateHasChanged)));
+        builder.AddContent(seq++, "刷新小群列表");
+        builder.CloseElement();
+        foreach (QuickChatConversation group in Runtime?.GetSmallGroups() ?? Array.Empty<QuickChatConversation>())
+        {
+            builder.OpenElement(seq++, "details");
+            builder.SetKey(group.Id);
+            builder.AddAttribute(seq++, "style", "margin:10px 0;padding:10px;border:1px solid rgba(128,128,128,.25);border-radius:6px;");
+            builder.OpenElement(seq++, "summary");
+            builder.AddAttribute(seq++, "style", "cursor:pointer;font-weight:650;padding:4px 0;");
+            builder.AddContent(seq++, group.Title + " · 建群者：" + QuickChatPrincipal.Parse(group.CreatorId).Name);
+            builder.CloseElement();
+            builder.AddContent(seq++, "主人（始终保留，拥有管理权限）");
+            foreach (string name in allCharacters.Concat(group.Members).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                string memberName = name;
+                bool included = group.Members.Contains(name, StringComparer.OrdinalIgnoreCase);
+                builder.OpenElement(seq++, "div");
+                builder.AddAttribute(seq++, "style", "display:flex;gap:16px;align-items:center;");
+                builder.OpenElement(seq++, "label");
+                builder.OpenElement(seq++, "input");
+                builder.AddAttribute(seq++, "type", "checkbox");
+                builder.AddAttribute(seq++, "checked", included);
+                builder.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this,
+                    args => ChangeMember(group, memberName, args.Value is true, false)));
+                builder.CloseElement();
+                builder.AddContent(seq++, memberName);
+                builder.CloseElement();
+                builder.OpenElement(seq++, "label");
+                builder.OpenElement(seq++, "input");
+                builder.AddAttribute(seq++, "type", "checkbox");
+                builder.AddAttribute(seq++, "disabled", !included);
+                builder.AddAttribute(seq++, "checked", group.MutedMembers.Contains(name, StringComparer.OrdinalIgnoreCase));
+                builder.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this,
+                    args => ChangeMember(group, memberName, args.Value is true, true)));
+                builder.CloseElement();
+                builder.AddContent(seq++, "限制回复");
+                builder.CloseElement();
+                builder.CloseElement();
+            }
+            builder.OpenElement(seq++, "button");
+            builder.AddAttribute(seq++, "type", "button");
+            builder.AddAttribute(seq++, "style", ButtonStyle);
+            builder.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
+            {
+                if (pendingDelete != group.Id) pendingDelete = group.Id;
+                else
+                {
+                    managementNote = Runtime?.DeleteSmallGroup(group.Id) ?? "快聊尚未运行";
+                    if (managementNote.StartsWith("已删除"))
+                        config.Groups?.RemoveAll(g => ("group:" + g.Name.Trim()).Equals(group.Id, StringComparison.OrdinalIgnoreCase));
+                    pendingDelete = null;
+                    CommitConfig();
+                }
+            }));
+            builder.AddContent(seq++, pendingDelete == group.Id ? "确认删除小群及记录" : "删除小群");
+            builder.CloseElement();
+            if (pendingDelete == group.Id)
+            {
+                builder.OpenElement(seq++, "button");
+                builder.AddAttribute(seq++, "type", "button");
+                builder.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () => pendingDelete = null));
+                builder.AddContent(seq++, "取消");
+                builder.CloseElement();
+            }
+            builder.CloseElement();
+        }
+        builder.OpenElement(seq++, "input");
+        builder.AddAttribute(seq++, "style", InputStyle);
+        builder.AddAttribute(seq++, "placeholder", "新小群名称");
+        builder.AddAttribute(seq++, "value", newGroupName);
+        builder.AddAttribute(seq++, "onchange", EventCallback.Factory.Create<ChangeEventArgs>(this, args => newGroupName = args.Value?.ToString() ?? ""));
+        builder.CloseElement();
+        builder.OpenElement(seq++, "button");
+        builder.AddAttribute(seq++, "type", "button");
+        builder.AddAttribute(seq++, "style", ButtonStyle);
+        builder.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
+        {
+            managementNote = Runtime?.CreateSmallGroup(newGroupName) ?? "快聊尚未运行";
+            if (managementNote.StartsWith("已创建")) newGroupName = "";
+        }));
+        builder.AddContent(seq++, "新增小群（先保留主人，再勾选成员）");
+        builder.CloseElement();
+        builder.AddContent(seq++, managementNote);
+        builder.CloseElement();
+        return seq;
+    }
+
+    void ChangeMember(QuickChatConversation group, string name, bool enabled, bool restriction)
+    {
+        var members = group.Members.ToList();
+        var muted = group.MutedMembers.ToList();
+        var target = restriction ? muted : members;
+        target.RemoveAll(n => n.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (enabled) target.Add(name);
+        managementNote = Runtime?.UpdateSmallGroup(group.Id, members, muted) ?? "快聊尚未运行";
+    }
+
+    /// <summary>
+    /// 「会话是怎么来的」说明区。
+    /// <para>
+    /// 这里原来放的是「已删除的会话 + 恢复全部」。那套机制（一份持久名单挡住同步逻辑）
+    /// 已经删掉了：受管会话（角色的私聊、公共大厅、配置里的群）的存在性只应该由
+    /// 「角色是否激活 / 配置里有没有这个群」决定，用名单挡的结果是删掉私聊的角色
+    /// 重新激活也回不来，而且群聊成员会跟着少人。
+    /// </para>
+    /// <para>
+    /// 现在快聊窗口左下角的「删除」对受管会话退化成「清空记录」，对自建会话才真删，
+    /// 所以不再需要恢复入口。这一段留下是为了让用户知道会话是怎么来的。
+    /// </para>
+    /// </summary>
+    int RenderConversationRules(RenderTreeBuilder builder, int sequence)
+    {
+        int seq = sequence;
+
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "style", "display:flex; flex-direction:column; gap:6px; padding-bottom:14px; border-bottom:1px solid rgba(128,128,128,.18);");
+
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "style", "font-weight:650;");
+        builder.AddContent(seq++, "会话是怎么来的");
+        builder.CloseElement();
+
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "style", "font-size:12px; line-height:1.5; color:rgba(128,128,128,.85);");
+        builder.AddContent(seq++, "每个已激活的角色都有一条私聊会话（还没聊过就是空的），"
+            + "加上公共大厅、下面配置的小群。所以「有没有会话」只取决于角色有没有激活、"
+            + "群有没有配在这里 —— 停用一个角色，它的私聊会话才会消失。");
+        builder.CloseElement();
+
+        builder.OpenElement(seq++, "div");
+        builder.AddAttribute(seq++, "style", "font-size:12px; line-height:1.5; color:rgba(128,128,128,.85);");
+        builder.AddContent(seq++, "快聊窗口左下角的「删除」：对上面的会话是清空聊天记录（会话保留），"
+            + "对你在窗口里「新建」出来的会话才是真删。");
+        builder.CloseElement();
+
+        builder.CloseElement();
+        return seq;
+    }
+
+    /// <summary>
+    /// 刷新「框架里有哪些角色 / 哪些已激活」。
+    /// 宿主还没注入 Module 时全部退化成空列表，不让配置页崩。
+    /// </summary>
+    void RefreshProbe()
+    {
+        try
+        {
+            allCharacters = Runtime?.GetAllCharacterNames() ?? Array.Empty<string>();
+            activeCharacters = Runtime?.GetActiveCharacterNames() ?? Array.Empty<string>();
+        }
+        catch (Exception)
+        {
+            allCharacters = Array.Empty<string>();
+            activeCharacters = Array.Empty<string>();
+        }
+    }
+
+    /// <summary>用探测到的角色新建一个群，成员直接填满，省得一个个手敲（敲错就是拉进幽灵成员）。</summary>
+    void AddGroupWithCharacters(bool onlyActive)
+    {
+        if (Configuration is not QuickChatConfig config)
+            return;
+
+        IReadOnlyList<string> names = onlyActive ? activeCharacters : allCharacters;
+        if (names.Count == 0)
+            return;
+
+        string label = onlyActive ? "激活角色" : "全部角色";
+        config.Groups.Add(new QuickChatGroupConfig
+        {
+            Name = $"{label}群 {config.Groups.Count + 1}",
+            Members = string.Join(",", names)
+        });
+        CommitConfig();
+    }
+
+    void OpenWindow()
+    {
+        if (Module is QuickChatModule module)
+            _ = module.OpenWindowAsync();
+    }
+
+    void UpdateGroup(int index, Action<QuickChatGroupConfig> mutate)
+    {
+        if (Configuration is not QuickChatConfig config || index < 0 || index >= config.Groups.Count)
+            return;
+
+        mutate(config.Groups[index]);
+        CommitConfig();
+    }
+
+    void AddGroup()
+    {
+        if (Configuration is not QuickChatConfig config)
+            return;
+
+        config.Groups.Add(new QuickChatGroupConfig { Name = $"小群 {config.Groups.Count + 1}" });
+        CommitConfig();
+    }
+
+    void RemoveGroup(int index)
+    {
+        if (Configuration is not QuickChatConfig config || index < 0 || index >= config.Groups.Count)
+            return;
+
+        config.Groups.RemoveAt(index);
+        CommitConfig();
+    }
+
+    void CommitConfig()
+    {
+        if (Configuration is not QuickChatConfig config)
+            return;
+
+        if (Module is IConfigurable configurable)
+            configurable.Configuration = config;
+
+        InvokeAsync(StateHasChanged);
     }
 
     int RenderControl(RenderTreeBuilder builder, int sequence, PropertyInfo property, object? value)

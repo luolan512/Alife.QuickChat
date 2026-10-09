@@ -6,7 +6,17 @@ const { pathToFileURL } = require("url");
 
 const channel = new URLSearchParams(location.search).get("channel");
 const app = document.getElementById("app");
-const petStrip = document.getElementById("petStrip");
+const sidebar = document.getElementById("sidebar");
+const sidebarRail = document.getElementById("sidebarRail");
+const sidebarPanel = document.getElementById("sidebarPanel");
+const railDots = document.getElementById("railDots");
+const recordReveal = document.getElementById("recordReveal");
+const bookmarkBar = document.getElementById("bookmarkBar");
+const sessionRecords = document.getElementById("sessionRecords");
+const recordHistory = document.getElementById("recordHistory");
+const recordCurrent = document.getElementById("recordCurrent");
+const recordActions = document.getElementById("recordActions");
+const conversationTitle = document.getElementById("conversationTitle");
 const titlebar = document.getElementById("titlebar");
 const composer = document.getElementById("composer");
 const minimizeButton = document.getElementById("minimizeButton");
@@ -14,6 +24,11 @@ const clearButton = document.getElementById("clearButton");
 const confirmOverlay = document.getElementById("confirmOverlay");
 const confirmOk = document.getElementById("confirmOk");
 const confirmCancel = document.getElementById("confirmCancel");
+const confirmTitle = document.getElementById("confirmTitle");
+const confirmText = document.getElementById("confirmText");
+const confirmPurge = document.getElementById("confirmPurge");
+const confirmPurgeLabel = document.getElementById("confirmPurgeLabel");
+const confirmHint = document.getElementById("confirmHint");
 const compactPetName = document.getElementById("compactPetName");
 const messageList = document.getElementById("messageList");
 const input = document.getElementById("input");
@@ -27,8 +42,20 @@ const regionScreenshotButton = document.getElementById("regionScreenshotButton")
 let screenshotBusy = false;
 
 const state = {
-  pets: [],
+  // 会话列表：私聊（kind="dm"，id=角色名）+ 群聊（kind="group"，id="group:群名"）。
+  conversations: [],
+  // 书签栏只放群聊（含公共大厅）。
+  groups: [],
   selectedId: null,
+  groupMode: false,
+  enableGroupChat: true,
+  // 鼠标扫过轨道是否自动弹开侧栏。默认关闭（键名与老版本的 sidebarHoverExpand 不同，
+  // 是故意换的：老配置里存着 true，沿用同名会让「默认关闭」对老用户失效）。
+  sidebarExpandOnHover: false,
+  // 用户上次把侧栏留在「展开」还是「收起」。只在页面加载后的第一条 state 上还原一次。
+  sidebarExpanded: false,
+  groupWindowWidth: 620,
+  groupWindowHeight: 560,
   maxVisibleMessages: 6,
   loadedMessageCount: 6,
   showAllMessages: false,
@@ -38,12 +65,22 @@ const state = {
   autoHeight: true,
   minWindowHeight: 96,
   maxWindowHeight: 460,
-  manualSizeOverride: false
+  manualSizeOverride: false,
+  // 「清理」弹窗里那个「同时删除原始记录消息」勾选框的默认值，由配置页决定（默认开）。
+  clearIncludesOriginal: true
 };
 
-const messagesByPet = new Map();
+// 确认弹窗当前要执行的动作。清理和删除会话共用同一个弹窗，靠它区分。
+let confirmHandler = null;
+
+const messagesByConversation = new Map();
+
+// 每个会话「磁盘里还有没有更早的消息」。由后端的 history / history-prepend 带过来，
+// 只有它为 true 时才允许向上翻页，避免滑到顶部反复空转。
+const hasMoreHistory = new Map();
+
 let lastStateSignature = "";
-let lastPetSignature = "";
+let lastConversationSignature = "";
 let lastMessageSignature = "";
 let lastComposerSignature = "";
 
@@ -127,13 +164,32 @@ function hexToRgba(color, opacity, fallback = "rgba(0, 0, 0, 0)") {
 
 function applyTheme(theme = {}) {
   const root = document.documentElement.style;
-  root.setProperty("--panel-color", hexToRgba(theme.panelColor, theme.panelOpacity, "rgba(17, 20, 28, 0.55)"));
+  const panelColor = theme.panelColor;
+  const panelOpacity = clampNumber(theme.panelOpacity, 0, 1, 1);
+  root.setProperty("--panel-color", hexToRgba(panelColor, panelOpacity, "rgba(17, 20, 28, 0.55)"));
   root.setProperty("--drop-blur", clampNumber(theme.dragBackdropBlur, 0, 80, 42) + "px");
   root.setProperty("--message-list-color", hexToRgba(theme.messageListColor, theme.messageListOpacity, "rgba(0, 0, 0, 0)"));
   root.setProperty("--assistant-bubble-color", hexToRgba(theme.assistantBubbleColor, theme.assistantBubbleOpacity, "rgba(255, 255, 255, 0.10)"));
   root.setProperty("--user-bubble-color", hexToRgba(theme.userBubbleColor, theme.userBubbleOpacity, "rgba(85, 130, 245, 0.25)"));
   root.setProperty("--input-color", hexToRgba(theme.inputColor, theme.inputOpacity, "rgba(255, 255, 255, 0.085)"));
   root.setProperty("--text-color", String(theme.textColor || "#EEF1F6"));
+
+  // 侧栏面板是浮在聊天区上面的，必须比主面板更不透明，否则底下的消息透上来会看不清。
+  root.setProperty(
+    "--sidebar-panel-color",
+    hexToRgba(panelColor, Math.min(1, panelOpacity + 0.34), "rgba(14, 18, 26, 0.94)"));
+  root.setProperty(
+    "--sidebar-rail-color",
+    hexToRgba(panelColor, Math.min(1, panelOpacity + 0.06), "rgba(255, 255, 255, 0.07)"));
+
+  // 侧栏两档宽度由后端下发（QuickChatConfig.SidebarRailWidth / SidebarPanelWidth）。
+  // 面板必须是固定像素宽：展开时窗口宽度会跟着变，如果用百分比就成了反馈环。
+  root.setProperty(
+    "--sidebar-rail-width",
+    Math.max(8, Number(theme.sidebarRailWidth) || 28) + "px");
+  root.setProperty(
+    "--sidebar-panel-width",
+    Math.max(80, Number(theme.sidebarPanelWidth) || 176) + "px");
 }
 
 
@@ -365,11 +421,15 @@ function buildOutgoingText(text) {
 
 async function sendDroppedImagesNow(files) {
   await addDroppedImages(files);
-  const pet = getSelectedPet();
-  if (!pet || pendingImages.length === 0)
+  const conversation = getSelectedConversation();
+  if (!conversation || pendingImages.length === 0)
     return;
 
-  sendMessage("send", { petId: pet.id, text: buildOutgoingText(""), attachmentPaths: pendingImages.map(item => item.path) });
+  sendMessage("send", {
+    conversationId: conversation.id,
+    text: buildOutgoingText(""),
+    attachmentPaths: pendingImages.map(item => item.path)
+  });
   pendingImages.length = 0;
   renderImagePreview();
   requestResize();
@@ -636,20 +696,48 @@ function renderMarkdown(value) {
   return html.join("");
 }
 
-function getMessages(petId) {
-  const key = petId || "";
-  if (messagesByPet.has(key) === false)
-    messagesByPet.set(key, []);
-  return messagesByPet.get(key);
+function getMessages(conversationId) {
+  const key = conversationId || "";
+  if (messagesByConversation.has(key) === false)
+    messagesByConversation.set(key, []);
+  return messagesByConversation.get(key);
 }
 
-function setMessages(petId, messages) {
-  messagesByPet.set(petId || "", messages || []);
+function setMessages(conversationId, messages) {
+  messagesByConversation.set(conversationId || "", messages || []);
+}
+
+function conversationKeyOf(message) {
+  return message?.conversationId || message?.petId || "";
 }
 
 function appendMessage(message) {
-  const list = getMessages(message.petId);
-  list.push(message);
+  const key = conversationKeyOf(message);
+  let list = getMessages(key);
+
+  // 占位气泡的收尾：同一角色在同一会话里只会有一条「还没定稿」的气泡。
+  // 收到这一轮的定稿时（id 是落盘编号，和临时 id 不同），旧的那条必须撤掉，
+  // 否则定稿会紧挨着它再冒一个，同一句话看起来说了两遍。
+  // 上一轮被新消息打断、没走到定稿的情况，也是靠这条清掉残留。
+  //
+  // 判据用 provisional 而不是 streaming：模型吐完字之后还会有一个「全文补推」
+  // （此时 streaming 已经是 false，但仍是占位气泡，必须等定稿来了才撤）。
+  if (message.role === "assistant") {
+    const kept = list.filter(item =>
+      item.provisional !== true || item.id === message.id || item.petId !== message.petId);
+    if (kept.length !== list.length)
+      list = kept;
+  }
+
+  // 按 id 去重：用户消息是先本地回显、后由后端翻状态的，
+  // 同一条会到两次。追加会造成重复气泡，必须替换。
+  const index = list.findIndex(item => item.id === message.id);
+  if (index >= 0)
+    list[index] = message;
+  else
+    list.push(message);
+
+  setMessages(key, list);
 }
 
 function formatTime(value) {
@@ -659,76 +747,631 @@ function formatTime(value) {
   return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function getSelectedPet() {
-  return state.pets.find(pet => pet.id === state.selectedId) || null;
+function getSelectedConversation() {
+  return state.conversations.find(item => item.id === state.selectedId) || null;
 }
 
-function petSignature() {
+function isGroupConversation(conversation) {
+  return conversation?.kind === "group";
+}
+
+/** 会话在界面上的显示名：私聊 = 角色名；群聊 = 群名。 */
+function conversationTitleOf(conversation) {
+  if (!conversation)
+    return "";
+  return conversation.title || conversation.id || "";
+}
+
+/** 顶栏成员显示：私聊 = 角色名；群聊 = 成员名（逗号分隔）。 */
+function conversationMembersOf(conversation) {
+  if (!conversation)
+    return [];
+  const members = Array.isArray(conversation.members) ? conversation.members.filter(Boolean) : [];
+  if (members.length > 0)
+    return members;
+  return conversation.title ? [conversation.title] : [];
+}
+
+/**
+ * 会话记录里的一行预览文本。
+ * 优先用本地已有消息（刚发出去还没回流也能立刻看到），
+ * 本地没有就退回后端随会话列表一起带来的摘要 —— 否则「上一个记录」永远是空的。
+ */
+function lastMessagePreview(conversation) {
+  const conversationId = typeof conversation === "string" ? conversation : conversation?.id;
+  const messages = messagesByConversation.get(conversationId || "");
+  if (messages && messages.length > 0) {
+    const last = messages[messages.length - 1];
+    const text = cleanDisplayText(last.text || "").replace(/\s+/g, " ").trim();
+    if (text.length === 0)
+      return { time: formatTime(last.createdAt), text: last.attachments?.length ? "[附件]" : "" };
+    return { time: formatTime(last.createdAt), text };
+  }
+
+  if (conversation && typeof conversation === "object" && (conversation.lastText || conversation.lastAt))
+    return { time: conversation.lastAt || "", text: conversation.lastText || "" };
+
+  return null;
+}
+
+function conversationSignature() {
   return JSON.stringify({
-    pets: state.pets.map(pet => [pet.id, pet.name, pet.busy === true]),
-    selectedId: state.selectedId
+    conversations: state.conversations.map(item => [
+      item.id, item.kind, item.title, item.busy === true, item.isLobby === true,
+      // canDelete / isCustom 决定左下角那两个按钮的样子，变了也得重绘。
+      item.canDelete !== false, item.isCustom === true,
+      (item.members || []).join(","), item.lastText || "", item.lastAt || ""
+    ]),
+    groups: (state.groups || []).map(item => [item.id, item.title, item.isLobby === true]),
+    selectedId: state.selectedId,
+    groupMode: state.groupMode === true,
+    enableGroupChat: state.enableGroupChat === true,
+    // 记录区要显示最后一条消息的摘要，所以消息变化也要触发重绘。
+    previews: state.conversations.map(item => {
+      const preview = lastMessagePreview(item);
+      return preview ? [item.id, preview.time, preview.text] : [item.id, "", ""];
+    })
   });
 }
 
-function renderPets() {
-  const signature = petSignature();
-  if (signature === lastPetSignature)
-    return;
+function createConversationButton(conversation, options = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = options.className || "conversation-item";
+  if (conversation.id === state.selectedId)
+    button.classList.add("selected");
+  if (isGroupConversation(conversation))
+    button.classList.add("group");
+  if (conversation.busy)
+    button.classList.add("busy");
 
-  lastPetSignature = signature;
-  petStrip.replaceChildren();
+  button.style.setProperty("--chip-color", colorFor(conversationTitleOf(conversation)));
+  button.title = conversation.busy
+    ? `${conversationTitleOf(conversation)} 正在回复`
+    : conversationTitleOf(conversation);
 
-  if (state.pets.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "pet-chip";
-    empty.style.opacity = ".5";
-    empty.textContent = "没有已激活桌宠";
-    petStrip.appendChild(empty);
-    return;
+  const name = document.createElement("span");
+  name.className = "conversation-name";
+  name.textContent = conversationTitleOf(conversation);
+  button.appendChild(name);
+
+  if (options.showPreview === true) {
+    const preview = lastMessagePreview(conversation);
+    const previewLine = document.createElement("span");
+    previewLine.className = "conversation-preview";
+    previewLine.textContent = preview && preview.text ? preview.text : "还没有消息";
+    const time = document.createElement("span");
+    time.className = "conversation-time";
+    time.textContent = preview ? preview.time : "";
+    button.append(previewLine, time);
   }
 
-  for (const pet of state.pets) {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "pet-chip";
-    if (pet.id === state.selectedId)
-      chip.classList.add("selected");
-    if (pet.busy)
-      chip.classList.add("busy");
+  button.addEventListener("click", () => {
+    if (conversation.id !== state.selectedId)
+      sendMessage("select-conversation", { conversationId: conversation.id });
+    // 选完就收回侧栏，别挡着聊天区。
+    collapseSidebarAfterSelect();
+  });
 
-    chip.style.setProperty("--chip-color", colorFor(pet.name));
-    chip.title = pet.busy ? `${pet.name} 正在回复` : pet.name;
+  return button;
+}
 
-    const name = document.createElement("span");
-    name.textContent = pet.name;
-    chip.appendChild(name);
-    chip.addEventListener("click", () => {
-      if (pet.id !== state.selectedId)
-        sendMessage("select", { id: pet.id });
+/* ────────────────────────── 侧栏收拉 ────────────────────────── */
+
+// 鼠标离开后不要立刻收回：从轨道移到面板上时中间会短暂「什么都不在上面」，
+// 立刻收回会造成面板一开一合的抖动。
+const SIDEBAR_COLLAPSE_DELAY = 260;
+// 悬停展开的「停留意图」：鼠标停在轨道上够久才弹开，扫过不算。
+const SIDEBAR_HOVER_INTENT_DELAY = 220;
+let sidebarCollapseTimer = null;
+let sidebarExpandTimer = null;
+let sidebarPinned = false;
+// 已经上报给后端的「展开 + 常驻」组合。只在真的翻转时才发消息，
+// 否则鼠标贴着轨道边缘抖动会让窗口反复改尺寸。
+let sidebarExpandedReported = false;
+let sidebarPinnedReported = false;
+// 后端下发的「用户上次把侧栏留在什么状态」只还原一次。
+// 每条 state 都强行套用的话，用户刚点开、后端还没收到回执的那一瞬间就会被打回去。
+let sidebarRestoredFromHost = false;
+
+/**
+ * 把「展开/收起」同步给后端：后端据此把窗口向左加宽、左边缘左移。
+ * 面板是往外弹的，所以聊天区宽度不变，只是旁边多长出一块。
+ *
+ * @param {boolean} remember
+ *   这次变化是不是「用户自己点的轨道」。是的话后端会把它记成偏好，下次呼出照此还原。
+ *   自动收起（选中会话、最小化成输入条、关掉群聊）传 false —— 那是临时的界面行为，
+ *   不该覆盖用户「我要它一直开着」的选择。
+ */
+function syncSidebarWindow(remember = false) {
+  const expanded = sidebar.classList.contains("expanded") || sidebar.classList.contains("pinned");
+  const pinned = sidebarPinned === true;
+  if (remember !== true && sidebarExpandedReported === expanded && sidebarPinnedReported === pinned)
+    return;
+
+  sidebarExpandedReported = expanded;
+  sidebarPinnedReported = pinned;
+  sendMessage("sidebar", { expanded, pinned, remember: remember === true });
+}
+
+function clearSidebarTimers() {
+  clearTimeout(sidebarCollapseTimer);
+  sidebarCollapseTimer = null;
+  clearTimeout(sidebarExpandTimer);
+  sidebarExpandTimer = null;
+}
+
+function expandSidebar() {
+  clearSidebarTimers();
+  sidebar.classList.add("expanded");
+  syncSidebarWindow();
+}
+
+function collapseSidebarNow() {
+  clearSidebarTimers();
+  sidebar.classList.remove("expanded");
+  syncSidebarWindow();
+}
+
+/**
+ * 悬停展开：鼠标得在轨道上「停住」够久才弹开，扫过不算。
+ * 展开会连带把窗口向左撑宽，蹭一下就开的话很干扰，所以加一道停留意图。
+ * 只在「侧栏悬停展开」开启时生效（默认关闭）。
+ */
+function scheduleExpandSidebar() {
+  if (state.sidebarExpandOnHover !== true)
+    return;
+  if (sidebarPinned || sidebar.classList.contains("expanded"))
+    return;
+
+  clearTimeout(sidebarExpandTimer);
+  sidebarExpandTimer = setTimeout(() => {
+    sidebarExpandTimer = null;
+    if (state.sidebarExpandOnHover === true && sidebarPinned === false)
+      expandSidebar();
+  }, SIDEBAR_HOVER_INTENT_DELAY);
+}
+
+function scheduleCollapseSidebar() {
+  if (sidebarPinned)
+    return;
+  clearTimeout(sidebarCollapseTimer);
+  clearTimeout(sidebarExpandTimer);
+  sidebarExpandTimer = null;
+  sidebarCollapseTimer = setTimeout(() => {
+    sidebarCollapseTimer = null;
+    sidebar.classList.remove("expanded");
+    syncSidebarWindow();
+  }, SIDEBAR_COLLAPSE_DELAY);
+}
+
+/** 连常驻状态一起收回。最小化成输入条时用：侧栏被 display:none 藏起来了，
+ *  但 pinned 还留着的话，窗口宽度和实际画出来的面板就会对不上。
+ *  注意这里不带 remember —— 收起是界面需要，不是用户的偏好。 */
+function forceCollapseSidebar() {
+  clearSidebarTimers();
+  sidebarPinned = false;
+  sidebar.classList.remove("expanded", "pinned");
+  syncSidebarWindow();
+}
+
+/**
+ * 页面加载后按后端记录的偏好还原一次侧栏状态。
+ * 只认第一条 state，之后就以本地的点击为准（否则用户刚点开就会被后端旧值打回去）。
+ */
+function restoreSidebarFromHost(expanded) {
+  if (sidebarRestoredFromHost)
+    return;
+  sidebarRestoredFromHost = true;
+
+  if (expanded !== true)
+    return;
+
+  sidebarPinned = true;
+  sidebar.classList.add("expanded", "pinned");
+  // 窗口在创建时已经按「展开」的几何出生了（后端 SavedSidebarExpanded 决定），
+  // 所以这里发出去的 expanded:true 是幂等的，不会引发一次多余的窗口加宽。
+  syncSidebarWindow();
+}
+
+function toggleSidebarPin() {
+  sidebarPinned = sidebarPinned !== true;
+  clearSidebarTimers();
+  sidebar.classList.toggle("pinned", sidebarPinned);
+
+  // 点击模式下「展开」和「常驻」是同一件事：点开就一直开着，再点就收起。
+  // 不再走 expandSidebar()/collapseSidebarNow()，因为那两个会把消息按「非用户意图」发出去，
+  // 后端就不会记住这次选择。
+  sidebar.classList.toggle("expanded", sidebarPinned);
+  syncSidebarWindow(true);
+}
+
+/** 选中一个会话后自动收回侧栏，好让聊天区完整露出来（常驻时不收）。 */
+function collapseSidebarAfterSelect() {
+  if (sidebarPinned === false)
+    collapseSidebarNow();
+}
+
+/**
+ * 轨道上的小点：**一条会话一个点**，顺序就是会话列表的顺序。
+ *
+ * 以前这里只遍历 state.groups（群聊），于是私聊在轨道上完全没有存在感 ——
+ * 轨道看上去只有「群」的入口。现在改成遍历 state.conversations：
+ * 私聊也有自己的颜色（和气泡、书签同一套 colorFor），顺序跟着会话列表走。
+ *
+ * 群聊画成小方块、私聊画成圆点，形状上一眼分得开（见 style.css 的 .rail-dot.group）。
+ * 点一下直接切过去 —— 轨道本来就是给「快速跳会话」用的。
+ */
+function renderRailDots() {
+  railDots.replaceChildren();
+
+  if (state.enableGroupChat !== true)
+    return;
+
+  const conversations = state.conversations || [];
+  for (const conversation of conversations.slice(0, 20)) {
+    const title = conversationTitleOf(conversation);
+
+    const dot = document.createElement("span");
+    dot.className = "rail-dot";
+    if (conversation.kind === "group")
+      dot.classList.add("group");
+    if (conversation.id === state.selectedId)
+      dot.classList.add("selected");
+
+    dot.style.setProperty("--chip-color", colorFor(title));
+    dot.title = conversation.kind === "group" ? `群聊：${title}` : `私聊：${title}`;
+    dot.addEventListener("click", event => {
+      // 别让点击冒泡到轨道上 —— 那会顺带把侧栏开合一次。
+      event.stopPropagation();
+      if (conversation.id !== state.selectedId)
+        sendMessage("select-conversation", { conversationId: conversation.id });
     });
 
-    petStrip.appendChild(chip);
+    railDots.appendChild(dot);
   }
+}
+
+function renderBookmarks() {
+  bookmarkBar.replaceChildren();
+
+  if (state.enableGroupChat !== true) {
+    bookmarkBar.classList.add("hidden");
+    return;
+  }
+  bookmarkBar.classList.remove("hidden");
+
+  const groups = state.groups || [];
+  if (groups.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "bookmark-empty";
+    empty.textContent = "无群聊";
+    bookmarkBar.appendChild(empty);
+    return;
+  }
+
+  for (const group of groups) {
+    const bookmark = createConversationButton(group, { className: "bookmark" });
+    bookmarkBar.appendChild(bookmark);
+  }
+}
+
+function renderSessionRecords() {
+  // 上区：聊过的会话（按最近活跃倒序），可以滚动翻看。
+  // 重建 DOM 会丢掉滚动位置，所以先记下来再还原。
+  const previousScroll = recordHistory.scrollTop;
+  recordHistory.replaceChildren();
+
+  const conversations = state.conversations || [];
+  if (conversations.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "record-empty";
+    empty.textContent = "没有已激活桌宠";
+    recordHistory.appendChild(empty);
+  } else {
+    const ordered = conversations;
+
+    for (const conversation of ordered) {
+      const item = createConversationButton(conversation, {
+        className: "conversation-item",
+        showPreview: true
+      });
+      recordHistory.appendChild(item);
+    }
+  }
+
+  recordHistory.scrollTop = previousScroll;
+
+  // 下区：当前会话卡片，固定显示在左下角。
+  recordCurrent.replaceChildren();
+  const selected = getSelectedConversation();
+  if (selected) {
+    const current = createConversationButton(selected, { className: "conversation-item current" });
+    recordCurrent.appendChild(current);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "record-empty";
+    empty.textContent = "未选择会话";
+    recordCurrent.appendChild(empty);
+  }
+
+  renderRecordActions(selected);
+}
+
+/**
+ * 当前会话旁边的两个操作。
+ *
+ * 新建 = 以当前会话为模板另开一条独立会话（私聊 dm:小梦#2、群聊 group:小群A#2）。
+ * 新会话与原来那条并存，记录互不影响 —— 这正是「清空后左侧新开的对话记录不受影响」的落点。
+ *
+ * 第二个按钮的文案跟着「这个会话能不能真的删掉」走，不写死：
+ *   - 自建会话（用户在窗口里「新建」出来的、角色自己拉群/开私聊建的）→ 「删除」，真删。
+ *   - 受管会话（角色的私聊、配置里的群、公共大厅）→ 「清空」，只清聊天记录。
+ *     它们的**存在性由「角色是否激活 / 配置里有没有这个群」决定**：角色激活着，私聊会话就该在，
+ *     哪怕一条消息都没有，那也是「空会话」而不是「没有会话」。所以删不掉，也不该删 ——
+ *     真删会连带两个后果：角色重新激活也回不来，而且群聊成员是从激活角色推出来的，会莫名少人。
+ * 文案和实际行为必须一致，否则用户点「删除」却发现会话还在，只会以为是 bug。
+ */
+function renderRecordActions(selected) {
+  recordActions.replaceChildren();
+
+  if (!selected) {
+    recordActions.classList.add("hidden");
+    return;
+  }
+  recordActions.classList.remove("hidden");
+
+  const title = conversationTitleOf(selected);
+
+  const createButton = document.createElement("button");
+  createButton.type = "button";
+  createButton.className = "record-action";
+  createButton.textContent = "新建";
+  createButton.title = `以「${title}」为模板另开一条会话（记录各自独立）`;
+  createButton.addEventListener("click", () => {
+    sendMessage("conversation-create", { conversationId: selected.id });
+  });
+  recordActions.appendChild(createButton);
+
+  const second = document.createElement("button");
+  second.type = "button";
+
+  if (selected.canDelete === false) {
+    // 公共大厅 + 角色私聊 + 配置群：只能清空。
+    second.className = "record-action";
+    second.textContent = "清空";
+    second.title = `清空「${title}」的聊天记录（会话保留：它由角色激活状态 / 群配置决定）`;
+    second.addEventListener("click", () => {
+      openConfirm({
+        title: "确认清空会话？",
+        text: `将清空「${title}」的全部聊天记录。这条会话由角色激活状态 / 群配置决定，会一直保留，`
+          + "所以清空后它还在，只是空的。",
+        okText: "清空",
+        showPurge: false,
+        onConfirm: () => clearConversation(selected.id, true)
+      });
+    });
+  } else {
+    // 自建会话：没有别的存在依据，可以真删。
+    second.className = "record-action danger";
+    second.textContent = "删除";
+    second.title = `删除「${title}」及其全部记录`;
+    second.addEventListener("click", () => {
+      openConfirm({
+        title: "确认删除会话？",
+        text: `将删除「${title}」及其全部聊天记录，无法恢复。`,
+        okText: "删除",
+        showPurge: false,
+        onConfirm: () => deleteConversation(selected.id)
+      });
+    });
+  }
+
+  recordActions.appendChild(second);
+}
+
+/**
+ * 找「和某个角色的私聊」会话。群聊顶栏双击角色名时用它。
+ * 优先取 ID 恰好等于角色名的那条（默认私聊）；没有就退回成员里含他的私聊
+ * （角色互相私聊的线也满足）。都找不到说明这个角色没有私聊线，返回 null 不响应双击。
+ */
+function findDirectConversation(name) {
+  if (!name)
+    return null;
+
+  const conversations = state.conversations || [];
+  const exact = conversations.find(item => item.kind === "dm" && item.id === name);
+  if (exact)
+    return exact;
+
+  return conversations.find(item =>
+    item.kind === "dm" && (item.members || []).some(member => member === name)) || null;
+}
+
+/**
+ * 打开确认弹窗。清理和删除会话共用它，文案与是否显示「删除原始记录」勾选框由调用方给。
+ * 不给 onConfirm 就是纯提示，确认后什么也不做。
+ */
+function openConfirm(options) {
+  confirmTitle.textContent = options.title || "确认？";
+  confirmText.textContent = options.text || "";
+  confirmOk.textContent = options.okText || "确定";
+
+  const showPurge = options.showPurge === true;
+  confirmPurgeLabel.classList.toggle("hidden", showPurge === false);
+  confirmHint.classList.toggle("hidden", showPurge === false);
+  if (showPurge)
+    confirmPurge.checked = options.purgeDefault !== false;
+
+  confirmHandler = typeof options.onConfirm === "function" ? options.onConfirm : null;
+
+  confirmOverlay.classList.add("visible");
+  confirmOverlay.setAttribute("aria-hidden", "false");
+  confirmOk.focus();
+}
+
+/**
+ * 清空当前会话。
+ * purge=true（勾选「同时删除原始记录消息」）连磁盘上的记录、以及角色脑子里的记忆一起清；
+ * purge=false 只清窗口显示，原始记录和角色记忆都留着。
+ * 两种都只动当前这一个会话，左侧别的会话不受影响。
+ *
+ * 注意：这几个函数必须是顶层函数，不能放进 DOMContentLoaded 里。
+ * renderRecordActions 是顶层函数，它在闭包里引用它们 ——
+ * 定义在回调内部的话，那里查不到，点按钮会抛 ReferenceError（而且只在运行时才暴露）。
+ */
+function clearCurrentConversation(purge) {
+  clearConversation(state.selectedId, purge);
+}
+
+/**
+ * 清空指定会话的消息。左下角「清空」和右上角「清理」都走这里。
+ * 只影响传进来的这一个会话。
+ */
+function clearConversation(conversationId, purge) {
+  if (!conversationId)
+    return;
+
+  setMessages(conversationId, []);
+  hasMoreHistory.set(conversationId, false);
+  sendMessage("clear", { conversationId, purge });
+
+  // 清的不是当前正在看的那条，就不动界面。
+  if (conversationId !== state.selectedId)
+    return;
+
+  state.loadedMessageCount = state.maxVisibleMessages;
+  state.manualSizeOverride = false;
+  renderMessages();
+  updateComposer();
+  requestResize();
+}
+
+/** 删掉一个自建会话连同它的记录。后端删完会重推 state，前端跟着切到剩下的会话。 */
+function deleteConversation(conversationId) {
+  if (!conversationId)
+    return;
+
+  messagesByConversation.delete(conversationId);
+  hasMoreHistory.delete(conversationId);
+  sendMessage("conversation-delete", { conversationId });
+}
+
+/** 顶栏成员显示。群聊换底色，与私聊的名字行做区分。 */
+function renderTitlebar() {
+  const selected = getSelectedConversation();
+  const groupMode = isGroupConversation(selected);
+
+  conversationTitle.classList.toggle("group", groupMode);
+  conversationTitle.replaceChildren();
+
+  if (!selected) {
+    const empty = document.createElement("span");
+    empty.className = "title-empty";
+    empty.textContent = "没有可对话的桌宠";
+    conversationTitle.appendChild(empty);
+    return;
+  }
+
+  const members = conversationMembersOf(selected);
+  if (groupMode) {
+    const label = document.createElement("span");
+    label.className = "title-label";
+    label.textContent = conversationTitleOf(selected) + " ·";
+    conversationTitle.appendChild(label);
+  }
+
+  members.slice(0, 12).forEach((member, index) => {
+    const chip = document.createElement("span");
+    chip.className = "member-chip";
+    chip.style.setProperty("--chip-color", colorFor(member));
+    chip.textContent = member;
+
+    // 双击角色名跳到跟他的私聊。
+    // 找不到对应私聊（角色没激活、或还没有私聊线）就不加 clickable、不绑事件，
+    // 免得点半天没反应看起来像坏了。
+    const direct = findDirectConversation(member);
+    if (direct) {
+      chip.classList.add("clickable");
+      chip.title = `双击跳到与「${member}」的私聊`;
+      chip.addEventListener("dblclick", () => {
+        if (direct.id !== state.selectedId)
+          sendMessage("select-conversation", { conversationId: direct.id });
+      });
+    }
+
+    conversationTitle.appendChild(chip);
+
+    if (index < members.length - 1) {
+      const separator = document.createElement("span");
+      separator.className = "member-separator";
+      separator.textContent = "·";
+      conversationTitle.appendChild(separator);
+    }
+  });
+
+  if (members.length > 12) {
+    const more = document.createElement("span");
+    more.className = "member-separator";
+    more.textContent = `等 ${members.length} 位`;
+    conversationTitle.appendChild(more);
+  }
+}
+
+function renderConversations() {
+  const signature = conversationSignature();
+  if (signature === lastConversationSignature)
+    return;
+
+  lastConversationSignature = signature;
+  renderRailDots();
+  renderBookmarks();
+  renderSessionRecords();
+  renderTitlebar();
 }
 
 function createMessageElement(message) {
   const bubble = document.createElement("article");
   const role = message.role || "assistant";
   bubble.className = "bubble " + role;
+  if (message.kind === "group")
+    bubble.classList.add("group");
 
   if (role !== "system") {
     const meta = document.createElement("div");
     meta.className = "message-meta";
 
+    // 名字显示逻辑：私聊显示「我 / 桌宠名」，群聊显示具体发言成员。
+    // 两者共用同一行样式，只是群聊会换底色（见 style.css 的 .bubble.group）。
+    const displayName = role === "user"
+      ? "我"
+      : (message.senderName || message.petName || "桌宠");
+
     const name = document.createElement("span");
     name.className = "role-name";
-    name.style.setProperty("--chip-color", colorFor(role === "user" ? "我" : message.petName));
-    name.textContent = role === "user" ? "我" : message.petName || "桌宠";
+    name.style.setProperty("--chip-color", colorFor(role === "user" ? "我" : displayName));
+    name.textContent = displayName;
 
     const time = document.createElement("span");
     time.className = "bubble-time";
     time.textContent = formatTime(message.createdAt);
     meta.append(name, time);
+
+    // 送达状态：以前这里什么都没有，消息被系统消息挤掉时用户完全看不出来，
+    // 只看到 AI 莫名其妙回了话。现在至少能看见「我发过、但没送到」。
+    if (role === "user" && message.deliveryState === "sending") {
+      const state = document.createElement("span");
+      state.className = "bubble-state";
+      state.textContent = "发送中";
+      meta.appendChild(state);
+    } else if (role === "user" && message.deliveryState === "failed") {
+      const state = document.createElement("span");
+      state.className = "bubble-state failed";
+      state.textContent = "未送达";
+      state.title = "这条消息没有进入对话上下文：可能被后一条消息打断，或被系统主动消息挤掉。";
+      meta.appendChild(state);
+    }
+
     bubble.appendChild(meta);
   }
 
@@ -803,7 +1446,31 @@ function createMessageElement(message) {
     bubble.appendChild(content);
   }
 
+  // 流式临时气泡：末尾挂一个闪动光标，明确「这句还在生成」。
+  if (message.streaming === true) {
+    if (content.parentNode !== bubble)
+      bubble.appendChild(content);
+    appendStreamingCaret(content);
+  }
+
   return bubble;
+}
+
+/**
+ * 把闪动光标挂到内容末尾。
+ * 必须钻进最后一个块级元素（<p>/<li>）里面，否则 <p> 的块级换行会把光标
+ * 甩到下一行开头，看起来像多了一个空段落。
+ */
+function appendStreamingCaret(content) {
+  const caret = document.createElement("span");
+  caret.className = "streaming-caret";
+  caret.setAttribute("aria-hidden", "true");
+
+  const last = content.lastElementChild;
+  if (last && /^(P|LI|BLOCKQUOTE|TD|TH)$/.test(last.tagName))
+    last.appendChild(caret);
+  else
+    content.appendChild(caret);
 }
 
 function messageSignature(messages) {
@@ -811,13 +1478,17 @@ function messageSignature(messages) {
     ? messages
     : messages.slice(-state.loadedMessageCount);
   return JSON.stringify({
-    petId: state.selectedId,
+    conversationId: state.selectedId,
     compact: state.compact,
     loadedMessageCount: state.loadedMessageCount,
     showAllMessages: state.showAllMessages,
     messages: visibleMessages.map(message => [
       message.id, message.role, message.petId, message.petName,
-      message.text, message.createdAt, message.attachments || []
+      message.senderName, message.text, message.createdAt,
+      message.deliveryState, message.attachments || [],
+      // 这两个标记都要进签名：定稿文本可能和最后一个分片一模一样，
+      // 只比文本的话签名不变、不会重渲染，末尾那个闪动光标就撤不掉了。
+      message.streaming === true, message.provisional === true
     ])
   });
 }
@@ -840,10 +1511,15 @@ function renderMessages(options = {}) {
     empty.className = "empty-state";
     empty.textContent = state.selectedId ? "开始对话吧。" : "激活桌宠后即可开始对话。";
     messageList.appendChild(empty);
-    requestResize();
+
+    // 空会话不主动改高度：新建出来的、或刚清空的会话一条消息都没有，
+    // 按内容算高度会把窗口压成一条缝（只剩标题栏 + 输入框），而用户马上要在这里打字，
+    // 窗口自己缩小非常碍事。保持当前大小即可。
+    // 紧凑模式例外 —— 那是用户显式切过去的，必须允许缩。
+    if (state.compact)
+      requestResize();
     return;
   }
-
   const visibleMessages = state.showAllMessages
     ? messages
     : messages.slice(-state.loadedMessageCount);
@@ -928,9 +1604,15 @@ function requestResize() {
 }
 
 function updateComposer() {
-  const pet = getSelectedPet();
-  const disabled = pet == null;
-  const signature = JSON.stringify([state.selectedId, pet?.name, pet?.busy === true]);
+  const conversation = getSelectedConversation();
+  const groupMode = isGroupConversation(conversation);
+  const disabled = conversation == null;
+  const signature = JSON.stringify([
+    state.selectedId,
+    conversationTitleOf(conversation),
+    conversation?.busy === true,
+    groupMode
+  ]);
   if (signature === lastComposerSignature)
     return;
 
@@ -938,40 +1620,53 @@ function updateComposer() {
   input.disabled = disabled;
   sendButton.disabled = disabled;
 
-  compactPetName.style.setProperty("--chip-color", pet ? colorFor(pet.name) : "#8fa3bf");
+  const displayName = conversationTitleOf(conversation);
+  compactPetName.style.setProperty("--chip-color", conversation ? colorFor(displayName) : "#8fa3bf");
   compactPetName.replaceChildren();
   const compactName = document.createElement("span");
-  compactName.textContent = pet?.name || "无桌宠";
+  compactName.textContent = conversation ? displayName : "无桌宠";
   compactPetName.appendChild(compactName);
-  compactPetName.title = pet ? `当前：${pet.name}${pet.busy ? "（回复中）" : ""}` : "没有已激活桌宠";
+  compactPetName.title = conversation
+    ? `当前：${displayName}${conversation.busy ? "（回复中）" : ""}`
+    : "没有已激活桌宠";
 
-  input.placeholder = disabled
-    ? "没有可对话的桌宠"
-    : pet.busy
-      ? `${pet.name} 正在回复/播报，可继续输入打断`
-      : "输入消息，Enter 发送；可粘贴图片或文件";
+  // 侧栏弹出时聊天区会临时变窄，长 placeholder 会折成两行并被裁掉，所以写短一点，
+  // 完整说明放到 title 里。
+  input.title = "Enter 发送，Shift+Enter 换行；可直接粘贴图片或文件";
+  if (disabled)
+    input.placeholder = "没有可对话的桌宠";
+  else if (groupMode)
+    input.placeholder = "在群里发言，Enter 发送";
+  else if (conversation.busy)
+    input.placeholder = `${displayName} 正在回复，可打断`;
+  else
+    input.placeholder = "输入消息，Enter 发送";
 }
 
 function selectByOffset(offset) {
-  if (state.pets.length === 0)
+  if (state.conversations.length === 0)
     return;
 
-  const currentIndex = Math.max(0, state.pets.findIndex(pet => pet.id === state.selectedId));
-  const nextIndex = (currentIndex + offset + state.pets.length) % state.pets.length;
-  const nextPet = state.pets[nextIndex];
-  if (nextPet && nextPet.id !== state.selectedId)
-    sendMessage("select", { id: nextPet.id });
+  const currentIndex = Math.max(0, state.conversations.findIndex(item => item.id === state.selectedId));
+  const nextIndex = (currentIndex + offset + state.conversations.length) % state.conversations.length;
+  const nextConversation = state.conversations[nextIndex];
+  if (nextConversation && nextConversation.id !== state.selectedId)
+    sendMessage("select-conversation", { conversationId: nextConversation.id });
 }
 
 function submitInput() {
   const text = input.value.trim();
-  const pet = getSelectedPet();
-  if (!pet || (text.length === 0 && pendingImages.length === 0))
+  const conversation = getSelectedConversation();
+  if (!conversation || (text.length === 0 && pendingImages.length === 0))
     return;
 
   const outgoingText = buildOutgoingText(text);
 
-  sendMessage("send", { petId: pet.id, text: outgoingText, attachmentPaths: pendingImages.map(item => item.path) });
+  sendMessage("send", {
+    conversationId: conversation.id,
+    text: outgoingText,
+    attachmentPaths: pendingImages.map(item => item.path)
+  });
   pendingImages.length = 0;
   renderImagePreview();
   input.value = "";
@@ -984,6 +1679,10 @@ ipcRenderer.on(channel, (_event, json) => {
   try {
     const payload = JSON.parse(json);
     switch (payload.type) {
+      // 注意：这里【没有】"sidebar" 分支。
+      // 侧栏的展开状态现在是「前端说了算、后端只负责记住」：
+      // 前端改状态 → 发 sidebar{expanded,pinned,remember} → 后端调窗口几何 + 记偏好。
+      // 后端不再反向命令前端收起 —— 那会让「展开就保持展开」在下一次隐藏窗口时被打回。
       case "screenshot-failed":
       case "screenshot-complete":
         if (screenshotButton)
@@ -994,20 +1693,52 @@ ipcRenderer.on(channel, (_event, json) => {
         break;
 
       case "state": {
-        state.pets = payload.pets || [];
+        state.conversations = payload.conversations || [];
+        state.groups = payload.groups || [];
+        state.groupMode = payload.groupMode === true;
+        state.enableGroupChat = payload.enableGroupChat !== false;
+        // 关掉群聊时整列侧栏收起（CSS 里按这个属性隐藏），否则聊天区会被白挤掉一列宽度。
+        app.dataset.groups = state.enableGroupChat ? "on" : "off";
+
+        state.sidebarExpandOnHover = payload.sidebarExpandOnHover === true;
+        sidebarRail.title = state.sidebarExpandOnHover
+          ? "鼠标移入展开；点击可常驻"
+          : "点击展开 / 收起会话导航";
+
+        // 先把「用户上次把侧栏留在什么状态」还原回来，再做别的判定。
+        // 顺序反了就会被下面那条「悬停展开关掉就收回」当场打回去 —— 用户明明上次开着，这次却是收起的。
+        restoreSidebarFromHost(payload.sidebarExpanded === true);
+
+        // 侧栏整列隐藏时窗口不能再留着展开的那部分宽度，否则右侧会空出一块。
+        if (state.enableGroupChat !== true)
+          forceCollapseSidebar();
+
+        // 悬停展开刚被关掉时，面板若是靠悬停撑开的（没常驻），立刻收回。
+        if (state.sidebarExpandOnHover !== true && sidebarPinned === false)
+          collapseSidebarNow();
+        state.groupWindowWidth = Number(payload.groupWindowWidth) || 620;
+        state.groupWindowHeight = Number(payload.groupWindowHeight) || 560;
         applyTheme(payload.theme || {});
-        if ((state.selectedId == null || state.pets.some(pet => pet.id === state.selectedId) === false) && state.pets.length > 0) {
-          payload.selectedId = state.pets[0].id;
-          sendMessage("select", { id: payload.selectedId });
+
+        // 只在「后端给的选中项不在列表里」时才回退到第一个会话。
+        // 注意判断的是 payload.selectedId（后端的当前选择），不是 state.selectedId（前端的旧值）：
+        // 窗口刚打开时前端还是 null，用前者判断会把后端选好的群聊强行改回第一个私聊。
+        const incomingSelected = payload.selectedId || null;
+        if ((incomingSelected == null ||
+             state.conversations.some(item => item.id === incomingSelected) === false) &&
+            state.conversations.length > 0) {
+          payload.selectedId = state.conversations[0].id;
+          sendMessage("select-conversation", { conversationId: payload.selectedId });
         }
 
         const pageSize = Math.max(1, Number(payload.maxVisibleMessages) || 6);
-        const pageSizeChanged = pageSize !== state.maxVisibleMessages;
         state.maxVisibleMessages = pageSize;
         state.loadedMessageCount = pageSize;
 
         state.showAllMessages = payload.showAllMessages === true;
         state.hideOnEscape = payload.hideOnEscape !== false;
+        // 「清理」弹窗里那个勾选框的默认值。
+        state.clearIncludesOriginal = payload.clearIncludesOriginal !== false;
         state.autoHeight = payload.autoHeight !== false;
         state.minWindowHeight = Math.max(52, Number(payload.minWindowHeight) || 96);
         state.maxWindowHeight = Math.max(state.minWindowHeight, Number(payload.maxWindowHeight) || 460);
@@ -1016,13 +1747,19 @@ ipcRenderer.on(channel, (_event, json) => {
         state.selectedId = payload.selectedId || null;
         if (selectedChanged) {
           state.loadedMessageCount = state.maxVisibleMessages;
-          if (messagesByPet.has(state.selectedId) === false)
+          // 换了会话就忘掉手动调过的尺寸：否则「只增不减」的手动模式会让窗口
+          // 卡在上一个会话（尤其是群聊）的高度上，切回私聊也缩不回来。
+          state.manualSizeOverride = false;
+          if (messagesByConversation.has(state.selectedId) === false)
             setMessages(state.selectedId, []);
         }
 
         const stateSignature = JSON.stringify({
-          pets: state.pets.map(pet => [pet.id, pet.name, pet.busy === true]),
+          conversations: state.conversations.map(item => [item.id, item.kind, item.title, item.busy === true]),
+          groups: state.groups.map(item => [item.id, item.title]),
           selectedId: state.selectedId,
+          groupMode: state.groupMode,
+          enableGroupChat: state.enableGroupChat,
           maxVisibleMessages: state.maxVisibleMessages,
           loadedMessageCount: state.loadedMessageCount,
           showAllMessages: state.showAllMessages,
@@ -1037,29 +1774,65 @@ ipcRenderer.on(channel, (_event, json) => {
           break;
 
         lastStateSignature = stateSignature;
-        renderPets();
+        renderConversations();
         renderMessages();
         updateComposer();
         break;
       }
 
+      case "refresh-state":
+        lastSentResizeSignature = "";
+        sendMessage("ready");
+        break;
       case "history": {
-        setMessages(payload.petId, payload.messages || []);
-        if (payload.petId === state.selectedId) {
+        const conversationId = payload.conversationId || payload.petId;
+        setMessages(conversationId, payload.messages || []);
+
+        hasMoreHistory.set(conversationId || "", payload.hasMore === true);
+        if (conversationId === state.selectedId) {
           state.loadedMessageCount = state.maxVisibleMessages;
           renderMessages();
           updateComposer();
+          if ((payload.messages || []).length > 0)
+            requestResize();
+        }
+        break;
+      }
+
+      // 向上翻页：后端从磁盘取更早的一页，前端往列表头部插。
+      // 必须按高度差补回滚动位置，否则视口会「跳」到最顶端，用户正在看的那几条会跑掉。
+      case "history-prepend": {
+        const conversationId = payload.conversationId || payload.petId;
+        hasMoreHistory.set(conversationId || "", payload.hasMore === true);
+        state.loadingOlderMessages = false;
+
+        if (conversationId === state.selectedId) {
+          const existing = getMessages(conversationId);
+          const known = new Set(existing.map(item => item.id));
+          const fresh = (payload.messages || []).filter(item => known.has(item.id) === false);
+
+          if (fresh.length > 0) {
+            const previousHeight = messageList.scrollHeight;
+            const previousTop = messageList.scrollTop;
+            setMessages(conversationId, fresh.concat(existing));
+            state.loadedMessageCount += fresh.length;
+            renderMessages();
+            messageList.scrollTop = previousTop + (messageList.scrollHeight - previousHeight);
+          }
         }
         break;
       }
 
       case "message": {
         appendMessage(payload);
-        if (payload.petId === state.selectedId) {
+        const conversationId = conversationKeyOf(payload);
+        if (conversationId === state.selectedId) {
           const followBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < 48;
           renderMessages({ preserveScroll: followBottom === false });
           updateComposer();
         }
+        // 会话记录区要更新「最后一条消息」摘要。
+        renderConversations();
         break;
       }
     }
@@ -1069,10 +1842,31 @@ ipcRenderer.on(channel, (_event, json) => {
 });
 
 document.addEventListener("DOMContentLoaded", () => {
+  // 侧栏：默认「点击轨道开关」（窗口会跟着向左变宽，鼠标扫过就撑开一下很干扰）。
+  // 只有在配置里打开「侧栏悬停展开」（默认关闭）之后，鼠标移入才会弹开 ——
+  // 而且要先停够 SIDEBAR_HOVER_INTENT_DELAY 才算数。
+  // 监听挂在 #sidebar（而不是轨道）上：面板是它的子元素，鼠标在面板上时
+  // mouseleave 不会触发，面板就不会自己缩回去。
+  sidebar.addEventListener("mouseenter", scheduleExpandSidebar);
+  sidebar.addEventListener("mouseleave", () => {
+    if (state.sidebarExpandOnHover !== true)
+      return;
+    scheduleCollapseSidebar();
+  });
+  sidebarRail.addEventListener("click", toggleSidebarPin);
+  sidebarRail.addEventListener("keydown", event => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleSidebarPin();
+    }
+  });
+
   minimizeButton.addEventListener("click", () => {
     state.compact = true;
     state.manualSizeOverride = false;
     app.dataset.mode = "compact";
+    // 输入条模式下侧栏整列被藏起来，先把窗口加宽的那部分收回去。
+    forceCollapseSidebar();
     renderMessages();
     updateComposer();
     requestResize();
@@ -1097,52 +1891,57 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   screenshotButton.addEventListener("click", () => {
-    const pet = getSelectedPet();
-    if (!pet || screenshotButton.disabled)
+    const conversation = getSelectedConversation();
+    if (!conversation || screenshotButton.disabled)
       return;
 
     screenshotButton.disabled = true;
     if (regionScreenshotButton)
       regionScreenshotButton.disabled = true;
     screenshotBusy = true;
-    sendMessage("screenshot-request", { petId: pet.id });
+    // 群聊没有单一收件角色，交给后端按当前会话推导（取群里第一个激活成员）。
+    sendMessage("screenshot-request", isGroupConversation(conversation) ? {} : { petId: conversation.id });
   });
 
   regionScreenshotButton?.addEventListener("click", () => {
-    const pet = getSelectedPet();
-    if (!pet || regionScreenshotButton.disabled)
+    const conversation = getSelectedConversation();
+    if (!conversation || regionScreenshotButton.disabled)
       return;
 
     screenshotButton.disabled = true;
     regionScreenshotButton.disabled = true;
     screenshotBusy = true;
-    sendMessage("screenshot-region-request", { petId: pet.id });
+    sendMessage("screenshot-region-request", isGroupConversation(conversation) ? {} : { petId: conversation.id });
   });
 
   clearButton.addEventListener("click", () => {
     if (state.selectedId == null)
       return;
 
-    confirmOverlay.classList.add("visible");
-    confirmOverlay.setAttribute("aria-hidden", "false");
-    confirmOk.focus();
+    openConfirm({
+      title: "确认清理？",
+      text: "只清空当前会话，左侧其它会话（包括你新开的）不受影响。",
+      okText: "清理",
+      showPurge: true,
+      // 默认值来自配置页的「清理默认包含原始记录」。
+      purgeDefault: state.clearIncludesOriginal,
+      onConfirm: purge => clearCurrentConversation(purge)
+    });
   });
 
   confirmOk.addEventListener("click", () => {
+    const handler = confirmHandler;
+    const purge = confirmPurge.checked === true;
     hideClearConfirm();
-    if (state.selectedId == null)
-      return;
-
-    state.loadedMessageCount = state.maxVisibleMessages;
-    state.manualSizeOverride = false;
-    setMessages(state.selectedId, []);
-    sendMessage("clear");
-    renderMessages();
-    updateComposer();
-    requestResize();
+    confirmHandler = null;
+    if (typeof handler === "function")
+      handler(purge);
   });
 
-  confirmCancel.addEventListener("click", hideClearConfirm);
+  confirmCancel.addEventListener("click", () => {
+    confirmHandler = null;
+    hideClearConfirm();
+  });
 
   composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -1151,6 +1950,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   window.addEventListener("keydown", event => {
     if (event.key === "Escape" && confirmOverlay.classList.contains("visible")) {
+      confirmHandler = null;
       hideClearConfirm();
       return;
     }
@@ -1230,16 +2030,25 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  // 滚动分页已注释：聊天记录固定只显示最近 MaxVisibleMessages 条，
-  // 只有打开“显示所有消息”时才会显示全部。
-  // messageList.addEventListener("scroll", () => {
-  //   if (state.compact || state.selectedId == null || state.loadingOlderMessages || state.showAllMessages)
-  //     return;
-  //
-  //   const loadThreshold = Math.min(48, Math.max(16, messageList.clientHeight * 0.10));
-  //   if (messageList.scrollTop <= loadThreshold)
-  //     loadOlderMessages();
-  // });
+  // 滚到顶部时向后端要一页更早的记录。
+  // 旧版本这里是纯前端翻页（只在已经加载到内存的消息里往回看），
+  // 接上落盘之后改成真的向后端请求，这样重启后也能一直往前翻。
+  messageList.addEventListener("scroll", () => {
+    if (state.compact || state.selectedId == null || state.loadingOlderMessages)
+      return;
+    if (hasMoreHistory.get(state.selectedId) !== true)
+      return;
+    if (messageList.scrollTop > 40)
+      return;
+
+    state.loadingOlderMessages = true;
+    sendMessage("load-older", { conversationId: state.selectedId });
+
+    // 兜底解锁：后端万一没有回包（例如会话刚好被删），不要让翻页永久卡死。
+    setTimeout(() => {
+      state.loadingOlderMessages = false;
+    }, 1500);
+  });
 
   lastInputHeight = input.offsetHeight;
   input.addEventListener("input", () => {
@@ -1325,7 +2134,7 @@ document.addEventListener("DOMContentLoaded", () => {
       addDroppedImages(files);
   });
 
-  renderPets();
+  renderConversations();
   renderMessages();
   renderImagePreview();
   updateComposer();

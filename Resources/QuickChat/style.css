@@ -34,6 +34,7 @@ body {
 }
 
 #app[data-mode="compact"] #titlebar,
+#app[data-mode="compact"] #sidebar,
 #app[data-mode="compact"] #messageList,
 #app[data-mode="compact"] #sendButton {
   display: none;
@@ -59,60 +60,510 @@ body {
   transform: translateZ(0);
 }
 
-#petStrip {
+/* ── 主区域：左列（书签 + 会话记录） + 右列（顶栏 + 消息 + 输入） ── */
+
+#body {
   display: flex;
   flex: 1;
-  gap: 5px;
-  min-width: 0;
-  overflow-x: auto;
-  padding: 1px;
-  scrollbar-width: none;
-}
-
-#petStrip::-webkit-scrollbar {
-  display: none;
-}
-
-.pet-chip {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 0 auto;
-  max-width: 124px;
-  height: 24px;
-  padding: 0 9px;
+  min-height: 0;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 999px;
-  background: var(--chip-color, #8fa3bf);
-  color: #12151c;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  cursor: pointer;
-  transition: transform .14s ease, box-shadow .14s ease, filter .14s ease;
-  user-select: none;
+}
+
+#mainColumn {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+  左列与顶栏、输入栏「平级」：它是一整列，不是嵌在顶栏或输入栏里。
+  上 = 群聊书签；下 = 会话记录。
+
+  默认只占一条窄轨道，鼠标移入才把面板「弹出」。
+
+  弹出是「往外弹」：面板展开的同时，窗口自己向左加宽、左边缘左移
+  （后端 ElectronQuickChatWindow.SetSidebarExpandedAsync），
+  所以聊天区的宽度自始至终不变，只是旁边多长出一块面板。
+
+  因此这里的宽度变化必须是瞬时的，不能做 transition —— 窗口改尺寸是瞬时的，
+  两边一旦差半拍，看到的就是聊天区先被撑开、再缩回去。
+  弹出的手感交给面板自己的淡入 + 轻微左移。
+*/
+#sidebar {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  width: var(--sidebar-rail-width, 28px);
+  min-width: var(--sidebar-rail-width, 28px);
+  min-height: 0;
+  overflow: hidden;
   -webkit-app-region: no-drag;
 }
 
-.pet-chip span {
+#sidebar.expanded,
+#sidebar.pinned {
+  /* 固定像素宽，不能用 %：窗口宽度会随展开变化，用 % 就成了反馈环，两边永远对不齐。
+     值由后端下发（QuickChatConfig.SidebarPanelWidth）。 */
+  width: var(--sidebar-panel-width, 176px);
+}
+
+#sidebar.hidden {
+  display: none;
+}
+
+/*
+  关掉群聊功能时整列都收起来。
+  后端只在 EnableGroupChat 时才把轨道宽度算进窗口宽度，
+  这里如果还留着轨道，聊天区就会被白挤掉一条。
+*/
+#app[data-groups="off"] #sidebar {
+  display: none;
+}
+
+/* ── 轨道：常驻的那一条窄边 ── */
+
+/*
+  轨道锚在侧栏「右缘」。
+  展开时窗口向左加宽，侧栏整块跟着窗口左缘一起左移；把轨道放在右缘，
+  它落在屏幕上的位置就恰好不动 —— 光标还停在原来的轨道上，
+  面板从轨道左侧展开。如果轨道在左缘，它会从光标底下跳走 148px，
+  光标反而落到面板的书签上，很容易误点。
+*/
+#sidebarRail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  width: var(--sidebar-rail-width, 28px);
+  padding: 7px 0 8px;
+  overflow: hidden;
+  border-right: 1px solid rgba(255, 255, 255, .10);
+  background: var(--sidebar-rail-color, rgba(255, 255, 255, .07));
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background .16s ease;
+}
+
+#sidebarRail:hover {
+  background: rgba(255, 255, 255, .15);
+}
+
+.rail-grip {
+  flex: 0 0 auto;
+  width: 3px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .34);
+  transition: background .16s ease;
+}
+
+#sidebar.expanded .rail-grip,
+#sidebar.pinned .rail-grip {
+  background: rgba(255, 255, 255, .68);
+}
+
+/* 轨道上的小圆点：一条会话一个点，顺序就是会话列表的顺序（私聊也在里面），
+   当前所在会话的那个会亮起来。群聊画成小方块，和私聊的圆点在形状上区分开。 */
+#railDots {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+  /* 会话多的时候（每个角色一条私聊 + 若干群）会排不下。
+     允许滚轮翻，但【不画】滚动条：轨道只有 28px 宽，一条滚动条会把它吃掉大半。 */
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+#railDots::-webkit-scrollbar {
+  display: none;
+}
+
+.rail-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border: 1px solid rgba(0, 0, 0, .30);
+  border-radius: 50%;
+  background: var(--chip-color, #8fa3bf);
+  transition: box-shadow .16s ease;
+}
+
+/* 群聊：小方块。一眼分得出「这条是私聊还是群」 */
+.rail-dot.group {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.rail-dot.selected {
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, .72);
+}
+
+/* ── 面板：填满轨道右边那一块，跟着 #sidebar 的宽度一起长出来 ── */
+
+/* ── 面板：占据轨道左边那一块，跟着窗口向左长出来 ── */
+
+#sidebarPanel {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: var(--sidebar-rail-width, 28px);
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  /* 右边缘紧贴轨道，分隔交给轨道自己的 border-right（那边才是贴着聊天区的一侧）。 */
+  background: var(--sidebar-panel-color, rgba(14, 18, 26, .94));
+  opacity: 0;
+  pointer-events: none;
+  /* 往左探出来一点：配合窗口左移，读起来就是「往外弹」。
+     只动 transform，不影响布局，所以不会把聊天区推来推去。 */
+  transform: translateX(-8px);
+  transition: opacity .14s ease, transform .18s cubic-bezier(.2, .7, .3, 1);
+}
+
+#sidebar.expanded #sidebarPanel,
+#sidebar.pinned #sidebarPanel {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+/* ── 书签栏：真的像书签，独立的很小区块，颜色比消息区浅 ── */
+
+#bookmarkBar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 4px;
+  max-height: 42%;
+  padding: 7px 7px 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-bottom: 1px solid rgba(255, 255, 255, .10);
+  background: rgba(255, 255, 255, .07);
+}
+
+#bookmarkBar.hidden {
+  display: none;
+}
+
+.bookmark {
+  display: block;
+  flex: 0 0 auto;
+  max-width: 100%;
+  padding: 3px 7px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .26);
+  border-radius: 4px 9px 9px 4px;
+  background: rgba(255, 255, 255, .18);
+  color: var(--text-color, #eef1f6);
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition: background .14s ease, border-color .14s ease;
+}
+
+.bookmark .conversation-name {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.pet-chip:hover {
-  filter: brightness(1.07);
+.bookmark:hover {
+  background: rgba(255, 255, 255, .28);
 }
 
-.pet-chip.selected {
-  border-color: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, .22);
+.bookmark.selected {
+  border-color: rgba(255, 255, 255, .70);
+  background: var(--chip-color, #8fa3bf);
+  color: #12151c;
+  font-weight: 700;
 }
 
-.pet-chip.busy::after {
+.bookmark.busy::after {
   content: "…";
-  margin-left: 4px;
+  margin-left: 3px;
   font-weight: 800;
+}
+
+.bookmark-empty,
+.record-empty {
+  width: 100%;
+  padding: 4px 2px;
+  color: rgba(238, 241, 246, .56);
+  font-size: 10px;
+  text-align: center;
+}
+
+/* ── 会话记录：默认收起，鼠标移入下半区才淡入 ── */
+
+/* ── 会话记录：直接显示 ── */
+
+/*
+  这里以前是「默认收起，鼠标移入才淡入」，还配了一块「会话记录 / 鼠标移入查看」的占位提示。
+  用户要求去掉：多一步操作才看得见的东西，等于看不见。
+  现在 #sessionRecords 恒定可见，#recordsHint 与 #recordReveal:hover 那几组规则一并删掉。
+  #recordReveal 保留下来只作布局用（占满书签栏以下的空间）。
+*/
+#recordReveal {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#sessionRecords {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.record-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 0;
+  padding: 5px 5px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* 和消息区（#messageList）用同一套滚动条外观。
+     这里刻意【不写】scrollbar-width：一旦设了它，Chrome 会改用系统默认配色的滚动条，
+     在深色主题下是一条突兀的浅色条，和窗口对不上 —— 这正是「滚动条太丑」的来源。 */
+  scrollbar-color: rgba(255, 255, 255, .20) transparent;
+}
+
+#recordHistory {
+  flex: 1 1 auto;
+}
+
+/* 左下角整块：当前会话卡片 + 它的操作按钮。
+   底色和分隔线放在外层，两个按钮和会话卡片看起来才是同一块，
+   不会各带一条边显得像两组东西。 */
+#recordFooter {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 3px;
+  border-top: 1px solid rgba(255, 255, 255, .12);
+  background: rgba(255, 255, 255, .06);
+}
+
+/* 当前会话卡片：只显示一行名字，永远不需要滚动。
+   原来它继承了 .record-zone 的 overflow-y:auto，又自己带了 max-height:42%，
+   而「页脚的 42%」比卡片本身还矮 —— 内容恒定溢出，于是默认就挂一条滚动条。
+   现在 overflow 直接关掉，名字靠 .conversation-name 的省略号截断。 */
+#recordCurrent {
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+/* 新建 / 删除：并排两个小按钮，压在会话卡片下面。 */
+#recordActions {
+  display: flex;
+  gap: 4px;
+  padding: 0 5px 5px;
+}
+
+#recordActions.hidden {
+  display: none;
+}
+
+.record-action {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .08);
+  color: var(--text-color, #eef1f6);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background .14s ease, border-color .14s ease, opacity .14s ease;
+}
+
+.record-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, .16);
+  border-color: rgba(255, 255, 255, .3);
+}
+
+.record-action.danger {
+  color: #ffb4b4;
+  border-color: rgba(255, 120, 120, .34);
+}
+
+.record-action.danger:hover:not(:disabled) {
+  background: rgba(255, 90, 90, .2);
+  border-color: rgba(255, 120, 120, .55);
+}
+
+.record-action:disabled {
+  opacity: .38;
+  cursor: not-allowed;
+}
+
+.conversation-item {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  gap: 1px;
+  width: 100%;
+  padding: 4px 6px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .08);
+  color: var(--text-color, #eef1f6);
+  text-align: left;
+  cursor: pointer;
+  transition: background .14s ease, border-color .14s ease;
+}
+
+.conversation-item:hover {
+  background: rgba(255, 255, 255, .17);
+}
+
+.conversation-item.selected,
+.conversation-item.current {
+  border-color: rgba(255, 255, 255, .46);
+  background: rgba(255, 255, 255, .21);
+}
+
+.conversation-item.group .conversation-name {
+  font-weight: 700;
+}
+
+.conversation-item.busy .conversation-name::after {
+  content: " …";
+  font-weight: 800;
+}
+
+.conversation-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.conversation-preview {
+  display: block;
+  overflow: hidden;
+  color: rgba(238, 241, 246, .62);
+  font-size: 10px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-time {
+  display: block;
+  color: rgba(238, 241, 246, .52);
+  font-size: 9px;
+}
+
+/* ── 顶栏：当前会话的成员显示 ── */
+
+#conversationTitle {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 2px 6px;
+  overflow-x: auto;
+  border-radius: 8px;
+  scrollbar-width: none;
+}
+
+#conversationTitle::-webkit-scrollbar {
+  display: none;
+}
+
+/* 群聊：名字那一行换底色，与私聊的显示逻辑区分开。 */
+#conversationTitle.group {
+  background: rgba(255, 255, 255, .14);
+}
+
+.title-label {
+  flex: 0 0 auto;
+  color: rgba(238, 241, 246, .72);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.title-empty {
+  color: rgba(238, 241, 246, .60);
+  font-size: 11px;
+}
+
+.member-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  max-width: 96px;
+  height: 20px;
+  padding: 0 7px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .16);
+  border-radius: 999px;
+  background: var(--chip-color, #8fa3bf);
+  color: #12151c;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 双击能跳到私聊的角色名。只加一点可点的暗示，
+   不做成按钮的样子 —— 顶栏一行十几个 chip，都长成按钮会很花。 */
+.member-chip.clickable {
+  cursor: pointer;
+}
+
+.member-chip.clickable:hover {
+  filter: brightness(1.25);
+  text-decoration: underline dotted;
+}
+
+.member-separator {
+  flex: 0 0 auto;
+  color: rgba(238, 241, 246, .54);
+  font-size: 10px;
+}
+
+#titleActions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
 }
 
 .title-button {
@@ -263,6 +714,22 @@ body {
 .bubble-time {
   color: rgba(238, 241, 246, .42);
   font-size: 10px;
+}
+
+.bubble-state {
+  color: rgba(238, 241, 246, .42);
+  font-size: 10px;
+}
+
+.bubble-state.failed {
+  color: #ff9a8b;
+}
+
+/* 群聊气泡：名字行的底色比私聊浅一点，让「谁在说话」更显眼。 */
+.bubble.group .message-meta {
+  padding: 1px 4px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .06);
 }
 
 .empty-state {
@@ -580,6 +1047,30 @@ body {
   word-break: break-word;
 }
 
+/*
+  流式临时气泡末尾的闪动光标。
+  它由 JS 塞进最后一个块级元素（<p>/<li>）里，所以能紧贴最后一个字，
+  不会被 <p> 的块级换行甩到下一行。
+*/
+.streaming-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: currentColor;
+  opacity: .7;
+  animation: quickchat-streaming-caret 1s steps(2, start) infinite;
+}
+
+@keyframes quickchat-streaming-caret {
+  to { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-caret { animation: none; }
+}
+
 .message-content p {
   margin: 2px 0;
 }
@@ -771,6 +1262,31 @@ body {
   margin-top: 6px;
   color: rgba(238, 241, 246, .78);
   font-size: 12px;
+}
+
+/* 「同时删除原始记录消息」勾选框。只有「清理」场景会显示，删除会话时整块藏起来。 */
+.confirm-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  color: rgba(238, 241, 246, .9);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+  user-select: none;
+}
+
+.confirm-option.hidden,
+.confirm-hint.hidden {
+  display: none;
+}
+
+.confirm-hint {
+  margin-top: 5px;
+  color: rgba(238, 241, 246, .5);
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .confirm-actions {

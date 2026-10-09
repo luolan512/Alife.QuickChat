@@ -56,6 +56,22 @@ public static class QuickChatContentFilter
         "温柔纸条"
     };
 
+    /// <summary>
+    /// 判断一条消息正文看起来是不是系统注入。
+    /// <para>
+    /// ⚠️ <b>不要再拿它当归属判定的主依据。</b>
+    /// 快聊已经改用「发送登记」（<c>QuickChatRuntime.ClaimPendingOutgoing</c>）——
+    /// 只有登记过的那条才进私聊流，认领不到的一律不进。
+    /// </para>
+    /// <para>
+    /// 为什么不能用它当主依据：这里的标记全是<b>用户可编辑的提示词</b>
+    /// （MessageFilter 的时间戳/尾注、SystemEventBoost 的各类 Prompt、
+    /// 快聊自己的 [消息来源(QuickChat)] 前缀），改一个字黑名单就失效；
+    /// 而失效的代价是把用户自己的话整条吞掉。而且 <c>ChatBot.Poke</c> 会把
+    /// 多个插件的内容拼成同一条消息，只要里面有一个标记，整条就没了。
+    /// </para>
+    /// <para>保留它只作日志/兜底用途。</para>
+    /// </summary>
     public static bool IsInjectedSystemMessage(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -274,6 +290,46 @@ public static class QuickChatContentFilter
         text = Regex.Replace(text, @"\n{3,}", "\n\n");
 
         return text.Trim();
+    }
+
+    /// <summary>附件标记只剩开标签时的样子（闭标签还没流到）。</summary>
+    static readonly Regex UnclosedAttachmentMarkerRegex = new(
+        @"\[{2}\s*\[?\s*QuickChat(?:Attachment|Image|File)\s*\]*\s*\]{2}",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// 流式过程中的即时清洗。
+    /// <para>
+    /// 规则和 <see cref="CleanAssistantText"/> 完全一致，额外只做一件事：把「还没流完的尾巴」抹掉。
+    /// 完整正则要求标签成对（<c>&lt;speak&gt;…&lt;/speak&gt;</c>）、附件标记也要求成对，
+    /// 而流式期间随时可能停在半个标签上 —— 那一刻正则匹配不到，原文就会被显示出来闪一下。
+    /// </para>
+    /// <para>
+    /// 注意：这里只用于「边生成边显示」的临时气泡。定稿仍然走
+    /// <see cref="ExtractQuickChatAttachmentSources"/> + <see cref="CleanAssistantText"/>，
+    /// 两条路径不能互相替代。
+    /// </para>
+    /// </summary>
+    public static string CleanStreamingText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        // 完整的附件标记先摘掉；摘不掉的（只有开标签）在下面按「未闭合」截断。
+        ExtractQuickChatAttachmentSources(raw, out string withoutAttachments);
+        string text = CleanAssistantText(withoutAttachments);
+
+        // 附件标记的开标签已经到齐、闭标签还没到：从这里往后全是路径，整段丢掉。
+        Match unclosed = UnclosedAttachmentMarkerRegex.Match(text);
+        if (unclosed.Success)
+            text = text.Substring(0, unclosed.Index);
+
+        // 标签 / 标记只流了一半（`<QuickChat`、`[[QuickCha`）：
+        // 完整正则都匹配不上，留着就会把半截源码显示出来。
+        text = Regex.Replace(text, @"<[A-Za-z_/!?][^>\n]*$", string.Empty);
+        text = Regex.Replace(text, @"\[{2,}[^\]\n]*$", string.Empty);
+
+        return text.TrimEnd();
     }
 }
 

@@ -1,11 +1,11 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data: file: blob:;">
   <title>QuickChat</title>
-  <link rel="stylesheet" href="style.css?v=202609210530">
+  <link rel="stylesheet" href="style.css?v=2026101006">
 </head>
 <body>
   <div id="resizeLayer" aria-hidden="true">
@@ -18,31 +18,81 @@
     <div class="resize-handle" data-edge="sw"></div>
     <div class="resize-handle" data-edge="se"></div>
   </div>
-  <main id="app" data-mode="expanded">
-    <header id="titlebar">
-      <div id="petStrip" aria-label="桌宠列表"></div>
-      <button id="screenshotButton" class="title-button" type="button" title="截取全屏并发送给当前桌宠">📷</button>
-      <button id="regionScreenshotButton" class="title-button" type="button" title="截取区域并发送给当前桌宠">✂️</button>
-      <button id="clearButton" type="button" title="清空快聊显示（不影响原始聊天记录）">清理</button>
-      <button id="minimizeButton" type="button" title="最小化为输入条">▼</button>
-    </header>
+  <main id="app" data-mode="expanded" data-groups="on">
+    <div id="body">
+      <!--
+        左列：与顶栏、输入栏「平级」的独立一列，不是嵌在它们里面。
+        默认只占一条窄轨道（#sidebarRail）。
+        展开方式看配置项「侧栏悬停展开」（默认关闭）：
+          关闭（默认）= 点击轨道开关；开启 = 鼠标在轨道上停住才弹开（带停留意图延迟）。
+        弹出是「往外弹」：窗口同时向左加宽、左边缘左移，聊天区宽度不变。
+        轨道锚在侧栏右缘，所以窗口左移时轨道在屏幕上不动，光标不会跳。
+          上半 = 群聊书签（独立小方块，颜色比消息区浅）
+          下半 = 会话记录，直接显示，不再需要鼠标移入
+      -->
+      <aside id="sidebar" aria-label="会话导航">
+        <div id="sidebarRail" role="button" tabindex="0" title="点击展开 / 收起会话导航">
+          <span class="rail-grip" aria-hidden="true"></span>
+          <div id="railDots" aria-hidden="true"></div>
+        </div>
+        <div id="sidebarPanel">
+          <section id="bookmarkBar" aria-label="群聊书签"></section>
+          <div id="recordReveal">
+            <section id="sessionRecords" aria-label="会话记录">
+              <div id="recordHistory" class="record-zone" aria-label="会话列表"></div>
+              <!--
+                左下角：当前会话 + 它的两个操作。
+                新建 = 以当前会话为模板另开一条独立会话（记录互不影响）；
+                清空 = 受管会话（角色私聊 / 公共大厅 / 配置群）擦掉记录，会话保留；
+                删除 = 自建会话连同记录一起删掉。
+              -->
+              <div id="recordFooter">
+                <div id="recordCurrent" class="record-zone current" aria-label="当前会话"></div>
+                <div id="recordActions" aria-label="当前会话操作"></div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </aside>
 
-    <section id="messageList" aria-live="polite"></section>
-    <section id="imagePreview" aria-label="待发送图片"></section>
+      <div id="mainColumn">
+        <header id="titlebar">
+          <div id="conversationTitle" aria-label="当前会话成员"></div>
+          <div id="titleActions">
+            <button id="screenshotButton" class="title-button" type="button" title="截取全屏并发送给当前会话">📷</button>
+            <button id="regionScreenshotButton" class="title-button" type="button" title="截取区域并发送给当前会话">✂️</button>
+            <button id="clearButton" type="button" title="清空快聊显示（不影响原始聊天记录）">清理</button>
+            <button id="minimizeButton" type="button" title="最小化为输入条">▼</button>
+          </div>
+        </header>
 
-    <form id="composer" autocomplete="off">
-      <button id="compactPetName" type="button" title="点击切换桌宠">桌宠</button>
-      <button id="attachButton" type="button" title="添加图片或文件">＋</button>
-      <input id="imageInput" type="file" multiple hidden>
-      <textarea id="input" rows="1" placeholder="输入消息，Enter 发送；可粘贴图片或文件"></textarea>
-      <button id="sendButton" type="submit">发送</button>
-      <button id="restoreButton" type="button" title="显示聊天框">▲</button>
-    </form>
+        <section id="messageList" aria-live="polite"></section>
+        <section id="imagePreview" aria-label="待发送图片"></section>
 
+        <form id="composer" autocomplete="off">
+          <button id="compactPetName" type="button" title="点击切换会话">会话</button>
+          <button id="attachButton" type="button" title="添加图片或文件">＋</button>
+          <input id="imageInput" type="file" multiple hidden>
+          <textarea id="input" rows="1" placeholder="输入消息，Enter 发送；可粘贴图片或文件"></textarea>
+          <button id="sendButton" type="submit">发送</button>
+          <button id="restoreButton" type="button" title="显示聊天框">▲</button>
+        </form>
+      </div>
+    </div>
+
+    <!--
+      通用确认弹窗：标题/正文/确认按钮文案/是否显示「删除原始记录」勾选框都由 JS 按场景填，
+      所以「清理当前会话」和「删除当前会话」共用这一个弹窗，不各写一套。
+    -->
     <div id="confirmOverlay" aria-hidden="true">
       <div class="confirm-panel" role="dialog" aria-modal="true">
-        <div class="confirm-title">确认清理？</div>
-        <div class="confirm-text">将清空快聊显示，不影响原始聊天记录。</div>
+        <div class="confirm-title" id="confirmTitle">确认清理？</div>
+        <div class="confirm-text" id="confirmText">只清空当前会话，左侧其它会话不受影响。</div>
+        <label class="confirm-option" id="confirmPurgeLabel">
+          <input id="confirmPurge" type="checkbox" checked>
+          <span>同时删除原始记录消息</span>
+        </label>
+        <div class="confirm-hint" id="confirmHint">取消勾选则只清空窗口里的显示，磁盘上的原始记录保留。</div>
         <div class="confirm-actions">
           <button id="confirmCancel" type="button">取消</button>
           <button id="confirmOk" type="button">清理</button>
@@ -57,16 +107,6 @@
     </div>
   </main>
 
-  <script src="main.js?v=202609220703"></script>
+  <script src="main.js?v=2026101006"></script>
 </body>
 </html>
-
-
-
-
-
-
-
-
-
-
