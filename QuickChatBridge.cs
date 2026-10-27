@@ -1,7 +1,7 @@
 using System;
 using System.Text.Json;
 using System.Threading.Tasks;
-using ElectronNET.API;
+using Alife.Client;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -15,7 +15,7 @@ public sealed class QuickChatBridge : IDisposable
 
     public string ChannelId { get; } = "marisa-quick-chat-" + Guid.NewGuid().ToString("N");
 
-    BrowserWindow? window;
+    IAlifeWindow? window;
     readonly ILogger<QuickChatModule> logger;
     static readonly JsonSerializerSettings JsonSettings = new()
     {
@@ -25,12 +25,14 @@ public sealed class QuickChatBridge : IDisposable
     public QuickChatBridge(ILogger<QuickChatModule> logger)
     {
         this.logger = logger;
-        Electron.IpcMain.On(ChannelId, OnIpcMessage);
+
     }
 
-    public void SetWindow(BrowserWindow? value)
+    public void SetWindow(IAlifeWindow? value)
     {
+        if (window != null) window.MessageReceived -= OnIpcMessage;
         window = value;
+        if (window != null) window.MessageReceived += OnIpcMessage;
     }
 
     public void Send(string type, object? payload = null)
@@ -52,7 +54,7 @@ public sealed class QuickChatBridge : IDisposable
                     envelope[pair.Name] = pair.Value;
             }
 
-            Electron.IpcMain.Send(window, ChannelId, envelope.ToString(Formatting.None));
+            _ = window.PostMessageAsync(envelope.ToString(Formatting.None));
         }
         catch (Exception exception)
         {
@@ -77,6 +79,25 @@ public sealed class QuickChatBridge : IDisposable
             if (string.IsNullOrWhiteSpace(type))
                 return;
 
+            if (type == "save-browser-file")
+            {
+                string requestId = root.GetProperty("requestId").GetString() ?? "";
+                try {
+                    string name = System.IO.Path.GetFileName(root.GetProperty("name").GetString() ?? "attachment.bin");
+                    string encoded = root.GetProperty("data").GetString() ?? "";
+                    string folder = System.IO.Path.Combine(Alife.Foundation.AlifePath.StorageFolderPath, "Plugins", "Marisa.QuickChat", "Temp", "Images");
+                    System.IO.Directory.CreateDirectory(folder);
+                    string target = System.IO.Path.Combine(folder, Guid.NewGuid().ToString("N") + "-" + name);
+                    System.IO.File.WriteAllBytes(target, Convert.FromBase64String(encoded));
+                    Send("browser-file-saved", new { requestId, path = target });
+                } catch (Exception ex) { Send("browser-file-saved", new { requestId, error = ex.Message }); }
+                return;
+            }
+            if (type == "open-local-file") {
+                string path = root.GetProperty("path").GetString() ?? "";
+                if (System.IO.File.Exists(path)) System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute=true });
+                return;
+            }
             OnMessage?.Invoke(type, root);
         }
         catch (Exception exception)
@@ -87,7 +108,6 @@ public sealed class QuickChatBridge : IDisposable
 
     public void Dispose()
     {
-        Electron.IpcMain.RemoveAllListeners(ChannelId);
         SetWindow(null);
     }
 }

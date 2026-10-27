@@ -63,6 +63,10 @@ public sealed class ChatRecord
     public string SenderId { get; set; } = "";
     public string SenderName { get; set; } = "";
     public string Text { get; set; } = "";
+    public string Reasoning { get; set; } = "";
+    public string ActivityTitle { get; set; } = "";
+    public string ActivityActorId { get; set; } = "";
+    public string ActivityKind { get; set; } = "";
     /// <summary><c>text</c> / <c>emote</c> / <c>batch</c> / <c>hint</c> / <c>notice</c>。</summary>
     public string ContentType { get; set; } = "text";
     public List<string> Mentions { get; set; } = new();
@@ -444,7 +448,11 @@ public sealed class QuickChatStore : IDisposable
         string text,
         int depth = 0,
         string contentType = "text",
-        bool persist = true)
+        bool persist = true,
+        string? reasoning = null,
+        string? activityTitle = null,
+        string? activityActorId = null,
+        string? activityKind = null)
     {
         text = (text ?? "").Trim();
         if (text.Length is < 1 or > 4000)
@@ -453,7 +461,7 @@ public sealed class QuickChatStore : IDisposable
         lock (gate)
         {
             ConversationData data = Require(conversationId);
-            if (HasMember(data.Meta, sender) == false)
+            if (!sender.IsSystem && HasMember(data.Meta, sender) == false)
                 throw new InvalidOperationException("你不是此会话的成员");
 
             if (data.Meta.IsGroup && sender.IsAgent &&
@@ -467,6 +475,10 @@ public sealed class QuickChatStore : IDisposable
                 SenderId = sender.Id,
                 SenderName = sender.IsHuman ? "我" : sender.Name,
                 Text = text,
+                Reasoning = reasoning ?? "",
+                ActivityTitle = activityTitle ?? "",
+                ActivityActorId = activityActorId ?? "",
+                ActivityKind = activityKind ?? "",
                 ContentType = string.IsNullOrWhiteSpace(contentType) ? "text" : contentType,
                 SentAt = DateTimeOffset.Now,
                 Depth = Math.Clamp(depth, 0, 32),

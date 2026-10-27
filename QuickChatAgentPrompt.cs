@@ -67,9 +67,10 @@ public static class QuickChatAgentPrompt
         if (enableGroupChat)
         {
             builder.AppendLine();
+            builder.AppendLine("公共大厅与虚拟世界的世界群聊互通。收到世界广播时，按虚拟世界的规则使用 Broadcast 发言；下面的快聊群聊投递纪律只适用于自建小群。");
             builder.AppendLine("**群聊（kind=group）**——除了你和主人，还有别的角色在场，"
                 + "你说的每句话**所有人都看得见**。");
-            builder.AppendLine("群聊里**必须调用 QuickChatSend 才能发言**，普通文字回复不会出现在聊天窗口里。");
+            builder.AppendLine("快聊小群里**必须调用 QuickChatSend 才能发言**，普通文字回复不会出现在聊天窗口里；世界广播按虚拟世界的规则发言。");
         }
 
         builder.AppendLine();
@@ -115,7 +116,7 @@ public static class QuickChatAgentPrompt
         if (enableGroupChat)
         {
             builder.AppendLine();
-            builder.AppendLine("### 群聊纪律（很重要：不要没完没了地接话）");
+            builder.AppendLine("### 快聊小群纪律（很重要：不要没完没了地接话）");
             builder.AppendLine("- 群聊里**只在被 @ 到、或者主人直接说话时**才需要认真回应。"
                 + "没被 @ 时默认**不必**回应。");
             builder.AppendLine("- **主人起个头，不等于要轮流接下去。** 别的角色说的话也不需要都回应。"

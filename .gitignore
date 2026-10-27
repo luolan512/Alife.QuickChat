@@ -1,0 +1,7 @@
+Temp/
+bin/
+obj/
+*.dll
+*.pdb
+*.user
+.vs/

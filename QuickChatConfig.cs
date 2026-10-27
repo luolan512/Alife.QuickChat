@@ -8,6 +8,17 @@ namespace Marisa.QuickChat;
 
 public class QuickChatConfig
 {
+    [DisplayName("简洁模式")]
+    [Description("隐藏思考、工具过程和系统主动事件，只显示聊天正文。关闭时完整显示；不影响历史记录保存。")]
+    public bool SimpleMode { get; set; }
+
+    [DisplayName("启用局域网访问")]
+    [Description("允许同一网络上的设备访问快聊；默认关闭。")]
+    public bool LanEnabled { get; set; }
+
+    [DisplayName("局域网端口")]
+    [Description("手机访问时使用的端口；修改后服务会重新启动。")]
+    public int LanPort { get; set; } = 17865;
     [DisplayName("全局快捷键")]
     [Description("全局快捷键列表。至少保留一个；使用 Electron Accelerator 格式，例如 Alt+Q、Ctrl+Alt+Space。")]
     public List<string> Hotkeys { get; set; } = new() { "Alt+Q" };
@@ -48,6 +59,11 @@ public class QuickChatConfig
     [Description("临时分析：图片临时发给模型分析，不保留在主上下文；多模态：图片保留在主上下文；仅路径：只发送路径文本，适合不支持图片的模型。可选值：临时分析、多模态、仅路径。")]
     [JsonConverter(typeof(StringEnumConverter))]
     public QuickChatScreenshotImageMode ScreenshotImageMode { get; set; } = QuickChatScreenshotImageMode.多模态;
+
+    [DisplayName("界面主题")]
+    [Description("默认主题保留当前样式及自定义配色。明亮系列：温暖晨曦、晴空映雪；深色系列：星际幽蓝（动态）、极夜碳黑。预设不覆盖原有配色设置，切回默认主题即可恢复。")]
+    [JsonConverter(typeof(StringEnumConverter))]
+    public QuickChatTheme ThemeStyle { get; set; } = QuickChatTheme.默认主题;
 
     [DisplayName("基础配色")]
     [Description("可选：自定义、深空、墨黑、雾白、蓝色、青色、绿色、紫色、樱粉、暖橙、透明。选择非自定义时会覆盖下方颜色；要单独调色请改为自定义。")]
@@ -298,3 +314,12 @@ public enum QuickChatScreenshotImageMode
     仅路径
 }
 
+
+public enum QuickChatTheme
+{
+    默认主题,
+    温暖晨曦,
+    QQNT蓝白,
+    星际幽蓝,
+    极夜碳黑
+}

@@ -13,6 +13,7 @@ namespace Marisa.QuickChat;
     "通过全局快捷键在鼠标位置呼出磨砂半透明对话框，可快速与已激活桌宠对话。",
     defaultCategory: "Marisa", editorUI: typeof(QuickChatConfigUI))]
 public class QuickChatModule(
+    IAlifeApplication alifeApplication,
     ChatActivitySystem chatActivitySystem,
     PluginSystem pluginSystem,
     XmlFunctionCaller functionCaller,
@@ -27,7 +28,7 @@ public class QuickChatModule(
 
     protected override async Task OnAwake()
     {
-        runtime = QuickChatRuntime.GetOrCreate(chatActivitySystem, pluginSystem, logger);
+        runtime = QuickChatRuntime.GetOrCreate(chatActivitySystem, pluginSystem, logger, alifeApplication);
         runtime.AddReference(this);
 
         // 群聊发言工具必须注册在每个角色自己的函数调用器上，AI 才「知道有这回事」。
@@ -42,6 +43,7 @@ public class QuickChatModule(
     protected override Task OnUpdate()
     {
         runtime?.ApplyConfig(Configuration, this);
+        runtime?.AttachToolEvents(Character.Name, functionCaller);
         return Task.CompletedTask;
     }
 
@@ -50,6 +52,7 @@ public class QuickChatModule(
         if (runtime == null)
             return Task.CompletedTask;
 
+        runtime.DetachToolEvents(Character.Name, functionCaller);
         if (runtime.Release(this))
             runtime = null;
 
@@ -62,6 +65,7 @@ public class QuickChatModule(
     /// 给个按钮省得每次都要记全局快捷键。
     /// </summary>
     public Task OpenWindowAsync() => runtime?.OpenWindowAsync() ?? Task.CompletedTask;
+    public string LanInfo => runtime?.LanInfo ?? "局域网访问未启动";
 
     // ────────────────────────── 工具 ──────────────────────────
 

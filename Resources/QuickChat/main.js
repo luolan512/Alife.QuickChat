@@ -1,9 +1,14 @@
-﻿const { ipcRenderer, shell, webUtils } = require("electron");
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
-const { pathToFileURL } = require("url");
-
+const ipcRenderer = { send: (_channel, message) => window.alifeWindow.postMessage(JSON.parse(message)), on: (_channel, handler) => window.alifeWindow.onMessage(message => handler(null, typeof message === "string" ? message : JSON.stringify(message))) };
+const path = { basename: value => String(value || "").split(/[\\/]/).pop() || "" };
+const pendingFileRequests = new Map();
+window.alifeWindow.onMessage(message => {
+  const data = typeof message === "string" ? JSON.parse(message) : message;
+  if (data.type !== "browser-file-saved") return;
+  const pending = pendingFileRequests.get(data.requestId);
+  if (!pending) return;
+  pendingFileRequests.delete(data.requestId);
+  data.error ? pending.reject(new Error(data.error)) : pending.resolve(data.path);
+});
 const channel = new URLSearchParams(location.search).get("channel");
 const app = document.getElementById("app");
 const sidebar = document.getElementById("sidebar");
@@ -47,6 +52,8 @@ const state = {
   // 书签栏只放群聊（含公共大厅）。
   groups: [],
   selectedId: null,
+  layoutGeneration: 0,
+  layoutRevision: 0,
   groupMode: false,
   enableGroupChat: true,
   // 鼠标扫过轨道是否自动弹开侧栏。默认关闭（键名与老版本的 sidebarHoverExpand 不同，
@@ -63,6 +70,7 @@ const state = {
   hideOnEscape: true,
   compact: false,
   autoHeight: true,
+  simpleMode: false,
   minWindowHeight: 96,
   maxWindowHeight: 460,
   manualSizeOverride: false,
@@ -87,33 +95,14 @@ let lastComposerSignature = "";
 let manualResizeEdge = null;
 let resizeDebounceTimer = null;
 let lastSentResizeSignature = "";
+let waitingForHistory = null;
+let historyWaitTimer = null;
 let lastInputHeight = 0;
 let pendingResizeMove = null;
 let resizeMoveScheduled = false;
 
 
 const pendingImages = [];
-const quickChatImageDirectory = path.join(__dirname, "..", "..", "Temp", "Images");
-
-// 快聊记录不持久化，重启后旧临时文件没有任何引用者，启动时直接清空。
-// 语义 = "Alife 退出/重启清理"（默认开）。窗口每次会话只创建一次，因此每次会话只清一遍。
-function cleanupTemporaryImages() {
-  try {
-    if (fs.existsSync(quickChatImageDirectory) === false)
-      return;
-    for (const entry of fs.readdirSync(quickChatImageDirectory)) {
-      try {
-        fs.unlinkSync(path.join(quickChatImageDirectory, entry));
-      } catch {
-        // 单个文件删除失败不影响其余清理。
-      }
-    }
-  } catch {
-    // 清理失败不影响启动。
-  }
-}
-cleanupTemporaryImages();
-
 function sendResizeMove() {
   if (manualResizeEdge == null)
     return;
@@ -190,142 +179,30 @@ function applyTheme(theme = {}) {
   root.setProperty(
     "--sidebar-panel-width",
     Math.max(80, Number(theme.sidebarPanelWidth) || 176) + "px");
+  window.QuickChatThemes?.apply(theme.style);
 }
 
 
-function ensureQuickChatImageDirectory() {
-  fs.mkdirSync(quickChatImageDirectory, { recursive: true });
-  return quickChatImageDirectory;
-}
-
-function normalizeLocalPath(value) {
-  return path.resolve(String(value || ""));
-}
-
-function isImagePath(value) {
-  return /^([A-Za-z]:[\\/]|\\\\)[^\n\r<>|*?"']+\.(png|jpe?g|gif|webp|bmp)$/i.test(String(value || "").trim());
-}
-
-function isAttachmentPathLine(value) {
-  const text = String(value || "").trim();
-  if (!text)
-    return false;
-  if (/^用户(?:发送了|文字)/.test(text))
-    return false;
-  return true;
-}
-
-function pathToFileUrl(value) {
-  try {
-    return pathToFileURL(normalizeLocalPath(value)).href;
-  } catch {
-    return "";
-  }
-}
-
-function sha1(value) {
-  return crypto.createHash("sha1").update(String(value)).digest("hex");
-}
-
-function thumbnailPathForSource(sourcePath) {
-  return path.join(ensureQuickChatImageDirectory(), "thumb-" + sha1(normalizeLocalPath(sourcePath)).slice(0, 16) + ".jpg");
-}
-
-function imageExtension(file) {
-  const extension = path.extname(file.name || "");
-  if (extension)
-    return extension.toLowerCase();
-  const type = String(file.type || "");
-  if (type.startsWith("image/")) {
-    const subtype = type.split("/")[1] || "png";
-    return subtype === "jpeg" ? ".jpg" : "." + subtype;
-  }
-  const subtype = type.split("/")[1] || "";
-  const cleaned = subtype.split(";")[0].replace(/[^a-z0-9]/gi, "");
-  return cleaned ? "." + cleaned : ".bin";
-}
-
-function getElectronFilePath(file) {
-  if (file.path)
-    return normalizeLocalPath(file.path);
-  try {
-    if (webUtils && typeof webUtils.getPathForFile === "function")
-      return normalizeLocalPath(webUtils.getPathForFile(file));
-  } catch {
-    // Clipboard screenshots do not always expose a source path.
-  }
-  return "";
-}
-
+function normalizeLocalPath(value) { return String(value || ""); }
+function isImagePath(value) { return /^([A-Za-z]:[\\/]|\\\\)[^\n\r<>|*?"']+\.(png|jpe?g|gif|webp|bmp)$/i.test(String(value || "").trim()); }
+function isAttachmentPathLine(value) { const text = String(value || "").trim(); return !!text && !/^用户(?:发送了|文字)/.test(text); }
+function pathToFileUrl(value) { const text=String(value || "").replace(/\\/g, "/"); return text ? "file:///" + encodeURI(text) : ""; }
+function thumbnailPathForSource(sourcePath) { return sourcePath; }
 async function saveTemporaryImage(file) {
-  ensureQuickChatImageDirectory();
-  const fileName = "file-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8) + imageExtension(file);
-  const filePath = path.join(quickChatImageDirectory, fileName);
-  const buffer = Buffer.from(await file.arrayBuffer());
-  fs.writeFileSync(filePath, buffer);
-  return normalizeLocalPath(filePath);
+  const data = new Uint8Array(await file.arrayBuffer());
+  let binary = ""; for(let i=0;i<data.length;i+=32768) binary += String.fromCharCode(...data.subarray(i,i+32768));
+  const requestId = Date.now()+"-"+Math.random().toString(36).slice(2);
+  return new Promise((resolve,reject) => { pendingFileRequests.set(requestId,{resolve,reject}); sendMessage("save-browser-file",{requestId,name:file.name || "attachment.bin",data:btoa(binary)}); setTimeout(() => { if(pendingFileRequests.delete(requestId)) reject(new Error("保存附件超时")); },30000); });
 }
-
-async function createThumbnail(file, sourcePath) {
-  const thumbnailPath = thumbnailPathForSource(sourcePath);
+async function addPendingImage(file) {
+  if(!file) return;
   try {
-    const buffer = getElectronFilePath(file)
-      ? fs.readFileSync(getElectronFilePath(file))
-      : Buffer.from(await file.arrayBuffer());
-    const blob = new Blob([buffer], { type: file.type || "image/png" });
-    const bitmap = await createImageBitmap(blob);
-    const maxSize = 320;
-    const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height, 1));
-    const width = Math.max(1, Math.round(bitmap.width * scale));
-    const height = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    context.drawImage(bitmap, 0, 0, width, height);
-    const dataUrl = canvas.toDataURL(file.type === "image/png" ? "image/png" : "image/jpeg", 0.86);
-    fs.writeFileSync(thumbnailPath, Buffer.from(dataUrl.split(",")[1], "base64"));
-    bitmap.close?.();
-    return normalizeLocalPath(thumbnailPath);
-  } catch {
-    try {
-      if (fs.existsSync(thumbnailPath) === false)
-        fs.copyFileSync(sourcePath, thumbnailPath);
-    } catch {
-      // Thumbnail creation is best-effort; the original path is still sent.
-    }
-    return normalizeLocalPath(thumbnailPath);
-  }
+    const filePath=await saveTemporaryImage(file);
+    const isImageFile=String(file.type || "").startsWith("image/");
+    pendingImages.push({id:Date.now()+"-"+Math.random().toString(36).slice(2),kind:isImageFile?"image":"file",name:file.name||path.basename(filePath),path:filePath,thumbnailPath:null,previewUrl:isImageFile?URL.createObjectURL(file):""});
+    renderImagePreview(); requestResize();
+  } catch(error) { console.error("保存附件失败",error); }
 }
-
-async function addPendingImage(file, preferTemporary = false) {
-  if (!file)
-    return;
-
-  const isImageFile = String(file.type || "").startsWith("image/");
-  let filePath = preferTemporary ? "" : getElectronFilePath(file);
-  if (!filePath)
-    filePath = await saveTemporaryImage(file);
-
-  let thumbnailPath = null;
-  let previewUrl = "";
-  if (isImageFile) {
-    thumbnailPath = await createThumbnail(file, filePath);
-    previewUrl = pathToFileUrl(thumbnailPath || filePath);
-  }
-
-  pendingImages.push({
-    id: Date.now() + "-" + Math.random().toString(36).slice(2, 8),
-    kind: isImageFile ? "image" : "file",
-    name: file.name || path.basename(filePath),
-    path: filePath,
-    thumbnailPath,
-    previewUrl
-  });
-  renderImagePreview();
-  requestResize();
-}
-
 function removePendingImage(id) {
   const index = pendingImages.findIndex(image => image.id === id);
   if (index >= 0)
@@ -446,9 +323,7 @@ function screenshotFileTimestamp(date) {
 }
 
 function openImagePath(filePath) {
-  if (!filePath || !shell || typeof shell.openPath !== "function")
-    return;
-  shell.openPath(filePath).catch(error => console.error("QuickChat open image failed", error));
+  if (filePath) sendMessage("open-local-file", { path: filePath });
 }
 
 function parseAttachmentPaths(block) {
@@ -487,7 +362,7 @@ function parseAttachmentMessageText(text) {
 }
 
 function messageImageUrl(image) {
-  if (image.thumbnailPath && fs.existsSync(image.thumbnailPath))
+  if (image.thumbnailPath)
     return pathToFileUrl(image.thumbnailPath);
   return pathToFileUrl(image.path);
 }
@@ -709,6 +584,15 @@ function setMessages(conversationId, messages) {
 
 function conversationKeyOf(message) {
   return message?.conversationId || message?.petId || "";
+}
+
+function removeProvisionalMessage(conversationId, id) {
+  const key = conversationId || "";
+  const list = getMessages(key);
+  const kept = list.filter(item => !(item.provisional === true && item.id === id));
+  if (kept.length === list.length) return false;
+  setMessages(key, kept);
+  return true;
 }
 
 function appendMessage(message) {
@@ -1330,6 +1214,130 @@ function renderConversations() {
   renderTitlebar();
 }
 
+const expandedReasoning = new Set();
+const expandedProcesses = new Set();
+
+const expandedActivityItems = new Set();
+function createActivityGroup(group, key) {
+  const box = document.createElement("details");
+  box.className = "process-group";
+  box.open = expandedProcesses.has(key);
+  let observedOpen = box.open;
+  box.addEventListener("toggle", () => {
+    if (box.open === observedOpen) return;
+    observedOpen = box.open;
+    if (box.open) expandedProcesses.add(key); else expandedProcesses.delete(key);
+    requestResize();
+  });
+  const heading = document.createElement("summary");
+  heading.textContent = "思考与工具过程 · " + group.length + " 项" + (group.some(item => item.provisional) ? " · 进行中" : "");
+  box.appendChild(heading);
+  for (const item of group) {
+    const row = document.createElement("details");
+    row.className = "process-item";
+    row.open = expandedActivityItems.has(item.id);
+    row.addEventListener("toggle", () => {
+      if (row.open) expandedActivityItems.add(item.id); else expandedActivityItems.delete(item.id);
+      requestResize();
+    });
+    const label = document.createElement("summary");
+    label.textContent = (item.activityTitle || "过程消息") + (item.provisional ? " · 进行中" : "");
+    const detail = document.createElement("div");
+    detail.className = "process-detail";
+    detail.textContent = item.text || "";
+    row.append(label, detail); box.appendChild(row);
+  }
+  return box;
+}
+function foldSilentSystemActivities(messages) {
+  const result = [];
+  for (let index = 0; index < messages.length;) {
+    const first = messages[index];
+    if (first.role !== "activity" || first.activityKind !== "system_event") {
+      result.push(first); index++; continue;
+    }
+    let end = index;
+    while (end < messages.length && messages[end].role === "activity") end++;
+    let foldEnd = end;
+    // A spoken reply keeps its own latest thought/tool sequence in its card.
+    if (messages[end]?.role === "assistant") {
+      for (let i = end - 1; i >= index; i--) {
+        if (messages[i].activityKind === "system_event") { foldEnd = i; break; }
+      }
+    }
+    if (foldEnd > index) {
+      const activities = messages.slice(index, foldEnd);
+      result.push({ ...first, foldedActivities: activities });
+      index = foldEnd;
+    } else {
+      result.push(first); index++;
+    }
+  }
+  return result;
+}
+
+function createEventDetail(message) {
+  const system = message.activityKind === "system_event";
+  const tool = !system && /工具/.test(message.activityTitle || "");
+  const detail = document.createElement(tool ? "details" : "section");
+  detail.className = "system-activity-detail event-entry " + (system ? "event-system" : "event-assistant") + (tool ? " event-tool" : "");
+  if (tool) {
+    detail.open = false;
+    detail.addEventListener("toggle", () => {
+      if (detail.isConnected && typeof requestResize === "function") requestResize();
+    });
+  }
+  const header = document.createElement(tool ? "summary" : "div");
+  header.className = "event-entry-header";
+  const label = document.createElement("span");
+  const actor = message.senderName || message.petName || (message.petId !== "system" ? message.petId : "") || "AI";
+  label.textContent = system ? "系统事件" : actor + " · " + (message.activityTitle || "处理过程");
+  const time = document.createElement("span");
+  time.className = "event-entry-time";
+  const date = new Date(message.createdAt);
+  time.textContent = Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  header.append(label, time);
+  const content = document.createElement("div");
+  content.className = "event-entry-content";
+  content.textContent = message.text || "";
+  detail.append(header, content);
+  return detail;
+}
+
+function createSystemMessageGroup(group, key) {
+  group = group.flatMap(message => message.foldedActivities || [message]).filter(message => !state.simpleMode || message.activityKind === "system_event");
+  const box = document.createElement("details");
+  box.className = "system-activity";
+  // New messages automatically fold proactive events back to a single line.
+  box.open = false;
+  box.addEventListener("toggle", () => {
+    if (box.isConnected) requestResize();
+  });
+  const heading = document.createElement("summary");
+  const eventCount = group.filter(message => message.activityKind === "system_event").length;
+  heading.textContent = "系统主动事件 · " + eventCount + " 次";
+  box.appendChild(heading);
+  for (const message of group) box.appendChild(createEventDetail(message));
+  return box;
+}
+function updateTurnHeader(turn, message, actor) {
+  let meta = turn.querySelector(":scope > .message-meta");
+  if (!meta) {
+    meta = document.createElement("div");
+    meta.className = "message-meta";
+    const name = document.createElement("span"); name.className = "role-name";
+    const time = document.createElement("span"); time.className = "bubble-time";
+    meta.append(name, time);
+    turn.prepend(meta);
+  }
+  const displayName = message.role === "assistant"
+    ? (message.senderName || message.petName || actor || "桌宠")
+    : (actor || "桌宠");
+  const name = meta.querySelector(".role-name");
+  name.style.setProperty("--chip-color", colorFor(displayName));
+  name.textContent = displayName;
+  meta.querySelector(".bubble-time").textContent = formatTime(message.createdAt);
+}
 function createMessageElement(message) {
   const bubble = document.createElement("article");
   const role = message.role || "assistant";
@@ -1440,8 +1448,24 @@ function createMessageElement(message) {
 
   const content = document.createElement("div");
   content.className = "message-content";
+  if (!state.simpleMode && typeof message.reasoning === "string" && message.reasoning.trim()) {
+    const details = document.createElement("details");
+    details.className = "message-reasoning";
+    details.open = expandedReasoning.has(message.id);
+    details.addEventListener("toggle", () => {
+      if (details.open) expandedReasoning.add(message.id);
+      else expandedReasoning.delete(message.id);
+    });
+    const summary = document.createElement("summary");
+    summary.textContent = "思考过程";
+    const thought = document.createElement("div");
+    thought.className = "message-reasoning-text";
+    thought.textContent = message.reasoning;
+    details.append(summary, thought);
+    bubble.appendChild(details);
+  }
   const displayText = hasAttachments ? parsedMessage.text : cleanDisplayText(message.text);
-  if (displayText || hasAttachments === false) {
+  if (displayText || (hasAttachments === false && !message.reasoning)) {
     content.innerHTML = renderMarkdown(displayText || "（无文本内容）");
     bubble.appendChild(content);
   }
@@ -1473,18 +1497,33 @@ function appendStreamingCaret(content) {
     content.appendChild(caret);
 }
 
+function visibleConversationMessages(messages) {
+  if (state.showAllMessages) return messages;
+  // The page limit counts chat replies, never the steps inside a reply.
+  let remaining = state.loadedMessageCount, start = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "activity") continue;
+    if (--remaining <= 0) {
+      start = i;
+      while (start > 0 && messages[start - 1].role === "activity") start--;
+      break;
+    }
+  }
+  return messages.slice(start);
+}
+
 function messageSignature(messages) {
-  const visibleMessages = state.showAllMessages
-    ? messages
-    : messages.slice(-state.loadedMessageCount);
+  const shown = messages;
+  const visibleMessages = visibleConversationMessages(shown);
   return JSON.stringify({
     conversationId: state.selectedId,
     compact: state.compact,
+    simpleMode: state.simpleMode,
     loadedMessageCount: state.loadedMessageCount,
     showAllMessages: state.showAllMessages,
     messages: visibleMessages.map(message => [
       message.id, message.role, message.petId, message.petName,
-      message.senderName, message.text, message.createdAt,
+      message.senderName, message.text, message.reasoning, message.activityTitle, message.activityKind, message.createdAt,
       message.deliveryState, message.attachments || [],
       // 这两个标记都要进签名：定稿文本可能和最后一个分片一模一样，
       // 只比文本的话签名不变、不会重渲染，末尾那个闪动光标就撤不掉了。
@@ -1497,6 +1536,7 @@ function renderMessages(options = {}) {
   const preserveScroll = options.preserveScroll === true;
   const previousBottomDistance = messageList.scrollHeight - messageList.scrollTop;
   const messages = getMessages(state.selectedId);
+  const shown = messages;
   messageList.classList.toggle("hidden", state.compact);
 
   const signature = messageSignature(messages);
@@ -1506,7 +1546,7 @@ function renderMessages(options = {}) {
   lastMessageSignature = signature;
   messageList.replaceChildren();
 
-  if (messages.length === 0) {
+  if (shown.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.textContent = state.selectedId ? "开始对话吧。" : "激活桌宠后即可开始对话。";
@@ -1516,15 +1556,64 @@ function renderMessages(options = {}) {
     // 按内容算高度会把窗口压成一条缝（只剩标题栏 + 输入框），而用户马上要在这里打字，
     // 窗口自己缩小非常碍事。保持当前大小即可。
     // 紧凑模式例外 —— 那是用户显式切过去的，必须允许缩。
-    if (state.compact)
-      requestResize();
+    requestResize();
     return;
   }
-  const visibleMessages = state.showAllMessages
-    ? messages
-    : messages.slice(-state.loadedMessageCount);
-  for (const message of visibleMessages)
-    messageList.appendChild(createMessageElement(message));
+  const visibleMessages = foldSilentSystemActivities(visibleConversationMessages(shown)).filter(message => !state.simpleMode || message.role !== "activity");
+  let anchor = "start";
+  let turn = null;
+  let turnActor = "";
+  let lastWasAssistant = false;
+  const actorOf = message => message.petId && message.petId !== "system" && message.petId !== "__user__" ? message.petId : "";
+  for (let index = 0; index < visibleMessages.length;) {
+    const message = visibleMessages[index];
+    if (message.role === "activity" && message.activityKind === "system_event") {
+      const group = [];
+      while (index < visibleMessages.length && visibleMessages[index].role === "activity" &&
+             visibleMessages[index].activityKind === "system_event") group.push(visibleMessages[index++]);
+      messageList.appendChild(createSystemMessageGroup(group, (state.selectedId || "") + ":" + (group[0].id || "")));
+      turn = null;
+      turnActor = "";
+      lastWasAssistant = false;
+      anchor = group[group.length - 1].id || anchor;
+      continue;
+    }
+    if (message.role !== "activity") {
+      if (message.role === "assistant") {
+        const actor = actorOf(message);
+        if (!turn || lastWasAssistant || (turnActor && actor && turnActor !== actor)) {
+          turn = document.createElement("div"); turn.className = "assistant-turn"; messageList.appendChild(turn);
+          turnActor = actor;
+        }
+        if (!turnActor) turnActor = actor;
+        updateTurnHeader(turn, message, turnActor);
+        const bubble = createMessageElement(message);
+        bubble.querySelector(":scope > .message-meta")?.remove();
+        turn.appendChild(bubble);
+        lastWasAssistant = true;
+      } else {
+        messageList.appendChild(createMessageElement(message));
+        turn = null;
+        turnActor = "";
+        lastWasAssistant = false;
+      }
+      anchor = message.id || anchor;
+      index++;
+      continue;
+    }
+    const group = [];
+    let groupActor = actorOf(message);
+    while (index < visibleMessages.length && visibleMessages[index].role === "activity" && visibleMessages[index].activityKind !== "system_event") {
+      const actor = actorOf(visibleMessages[index]);
+      if (groupActor && actor && groupActor !== actor) break;
+      if (!groupActor) groupActor = actor;
+      group.push(visibleMessages[index++]);
+    }
+    if (!turn || (turnActor && groupActor && turnActor !== groupActor)) { turn = document.createElement("div"); turn.className = "assistant-turn"; messageList.appendChild(turn); turnActor = groupActor; updateTurnHeader(turn, message, turnActor); }
+    if (!turnActor && groupActor) { turnActor = groupActor; updateTurnHeader(turn, message, turnActor); }
+    turn.appendChild(createActivityGroup(group, (state.selectedId || "") + ":" + anchor));
+    lastWasAssistant = false;
+  }
 
   if (preserveScroll)
     messageList.scrollTop = Math.max(0, messageList.scrollHeight - previousBottomDistance);
@@ -1552,12 +1641,12 @@ function loadOlderMessages() {
 
 function sendResizePayload(desired, compact) {
   const height = Math.max(52, Math.round(desired / 2) * 2);
-  const signature = `${compact}:${height}`;
+  const signature = `${state.selectedId}:${state.layoutGeneration}:${state.layoutRevision}:${window.innerWidth}:${compact}:${height}`;
   if (signature === lastSentResizeSignature)
     return;
 
   lastSentResizeSignature = signature;
-  sendMessage("resize", { height, compact });
+  sendMessage("resize", { height, compact, conversationId: state.selectedId, layoutGeneration: state.layoutGeneration, layoutRevision: state.layoutRevision, viewportWidth: window.innerWidth });
 }
 
 function requestResize() {
@@ -1569,24 +1658,23 @@ function requestResize() {
     if (manualResizeEdge != null)
       return;
 
+    if (!state.selectedId || waitingForHistory === state.selectedId)
+      return;
+
     // Minimal mode is an explicit mode switch, so always allow it to shrink.
     if (state.compact) {
       sendResizePayload(12 + composer.getBoundingClientRect().height, true);
       return;
     }
 
-    if (state.autoHeight === false)
-      return;
-
-    if (state.manualSizeOverride) {
-      const desired = document.documentElement.scrollHeight;
-      if (desired > window.innerHeight) {
-        lastSentResizeSignature = "";
-        sendMessage("resize", { height: Math.ceil(desired), compact: state.compact });
-      }
+    if (state.autoHeight === false) {
+      // Also completes the hidden-window startup handshake in fixed-height mode.
+      sendResizePayload(window.innerHeight, false);
       return;
     }
 
+    // The host preserves a manually saved minimum; always report the current
+    // measurement, including when content already fits after manual resizing.
     const listStyle = getComputedStyle(messageList);
     let contentHeight = 0;
     for (const child of messageList.children)
@@ -1597,8 +1685,10 @@ function requestResize() {
     const padding = (Number.parseFloat(listStyle.paddingTop) || 0)
       + (Number.parseFloat(listStyle.paddingBottom) || 0);
     const listHeight = contentHeight + gaps + padding;
-    const desired = 16 + titlebar.getBoundingClientRect().height
-      + composer.getBoundingClientRect().height + listHeight;
+    const chromeHeight = 14 + titlebar.getBoundingClientRect().height
+      + composer.getBoundingClientRect().height + imagePreview.getBoundingClientRect().height;
+    const emptyHeight = getMessages(state.selectedId).length === 0 ? Math.max(state.minWindowHeight, 180) : 0;
+    const desired = Math.max(emptyHeight, chromeHeight + listHeight);
     sendResizePayload(desired, state.compact);
   }, 80);
 }
@@ -1617,7 +1707,7 @@ function updateComposer() {
     return;
 
   lastComposerSignature = signature;
-  input.disabled = disabled;
+  if (input.disabled !== disabled) input.disabled = disabled;
   sendButton.disabled = disabled;
 
   const displayName = conversationTitleOf(conversation);
@@ -1676,6 +1766,11 @@ function submitInput() {
 }
 
 ipcRenderer.on(channel, (_event, json) => {
+  const composerSelection = document.activeElement === input ? {
+    conversationId: state.selectedId,
+    start: input.selectionStart, end: input.selectionEnd,
+    direction: input.selectionDirection, scrollTop: input.scrollTop
+  } : null;
   try {
     const payload = JSON.parse(json);
     switch (payload.type) {
@@ -1716,6 +1811,7 @@ ipcRenderer.on(channel, (_event, json) => {
         // 悬停展开刚被关掉时，面板若是靠悬停撑开的（没常驻），立刻收回。
         if (state.sidebarExpandOnHover !== true && sidebarPinned === false)
           collapseSidebarNow();
+        state.simpleMode = payload.simpleMode === true;
         state.groupWindowWidth = Number(payload.groupWindowWidth) || 620;
         state.groupWindowHeight = Number(payload.groupWindowHeight) || 560;
         applyTheme(payload.theme || {});
@@ -1743,9 +1839,19 @@ ipcRenderer.on(channel, (_event, json) => {
         state.minWindowHeight = Math.max(52, Number(payload.minWindowHeight) || 96);
         state.maxWindowHeight = Math.max(state.minWindowHeight, Number(payload.maxWindowHeight) || 460);
 
-        const selectedChanged = state.selectedId !== payload.selectedId;
+        state.layoutRevision = Math.max(state.layoutRevision, Number(payload.layoutRevision) || 0);
+        const incomingGeneration = Number(payload.layoutGeneration) || 0;
+        const selectedChanged = state.selectedId !== payload.selectedId || state.layoutGeneration !== incomingGeneration;
         state.selectedId = payload.selectedId || null;
+        state.layoutGeneration = incomingGeneration;
         if (selectedChanged) {
+          clearTimeout(resizeDebounceTimer);
+          clearTimeout(historyWaitTimer);
+          waitingForHistory = state.selectedId;
+          // Do not leave the window invisible if a history reply is unavailable.
+          historyWaitTimer = setTimeout(() => { waitingForHistory = null; requestResize(); }, 1000);
+          lastSentResizeSignature = "";
+          lastMessageSignature = "";
           state.loadedMessageCount = state.maxVisibleMessages;
           // 换了会话就忘掉手动调过的尺寸：否则「只增不减」的手动模式会让窗口
           // 卡在上一个会话（尤其是群聊）的高度上，切回私聊也缩不回来。
@@ -1758,12 +1864,14 @@ ipcRenderer.on(channel, (_event, json) => {
           conversations: state.conversations.map(item => [item.id, item.kind, item.title, item.busy === true]),
           groups: state.groups.map(item => [item.id, item.title]),
           selectedId: state.selectedId,
+          layoutGeneration: state.layoutGeneration,
           groupMode: state.groupMode,
           enableGroupChat: state.enableGroupChat,
           maxVisibleMessages: state.maxVisibleMessages,
           loadedMessageCount: state.loadedMessageCount,
           showAllMessages: state.showAllMessages,
           hideOnEscape: state.hideOnEscape,
+          simpleMode: state.simpleMode,
           autoHeight: state.autoHeight,
           minWindowHeight: state.minWindowHeight,
           maxWindowHeight: state.maxWindowHeight,
@@ -1777,11 +1885,21 @@ ipcRenderer.on(channel, (_event, json) => {
         renderConversations();
         renderMessages();
         updateComposer();
+        if (selectedChanged) requestAnimationFrame(() => requestAnimationFrame(requestResize));
         break;
       }
 
+      case "window-layout":
+      case "measure-layout":
+        state.layoutRevision = Math.max(state.layoutRevision, Number(payload.layoutRevision) || 0);
+        lastSentResizeSignature = "";
+        requestAnimationFrame(() => requestAnimationFrame(requestResize));
+        break;
       case "refresh-state":
         lastSentResizeSignature = "";
+        waitingForHistory = state.selectedId;
+        clearTimeout(historyWaitTimer);
+        historyWaitTimer = setTimeout(() => { waitingForHistory = null; requestResize(); }, 1000);
         sendMessage("ready");
         break;
       case "history": {
@@ -1790,11 +1908,12 @@ ipcRenderer.on(channel, (_event, json) => {
 
         hasMoreHistory.set(conversationId || "", payload.hasMore === true);
         if (conversationId === state.selectedId) {
+          clearTimeout(historyWaitTimer);
+          waitingForHistory = null;
           state.loadedMessageCount = state.maxVisibleMessages;
           renderMessages();
           updateComposer();
-          if ((payload.messages || []).length > 0)
-            requestResize();
+          requestResize();
         }
         break;
       }
@@ -1823,6 +1942,16 @@ ipcRenderer.on(channel, (_event, json) => {
         break;
       }
 
+      case "stream-end": {
+        const key = payload.conversationId || "";
+        if (removeProvisionalMessage(key, payload.id)) {
+          if (key === state.selectedId)
+            renderMessages({ preserveScroll: true });
+          renderConversations();
+        }
+        break;
+      }
+
       case "message": {
         appendMessage(payload);
         const conversationId = conversationKeyOf(payload);
@@ -1838,6 +1967,20 @@ ipcRenderer.on(channel, (_event, json) => {
     }
   } catch (error) {
     console.error("QuickChat message error", error);
+  } finally {
+    if (composerSelection) {
+      const restore = () => {
+        if (state.selectedId !== composerSelection.conversationId || input.disabled || !document.hasFocus()) return;
+        // Preserve typing across refreshes, without taking focus from a button,
+        // another editor or another application selected by the user.
+        if (document.activeElement !== document.body && document.activeElement !== document.documentElement) return;
+        input.focus({ preventScroll: true });
+        input.setSelectionRange(composerSelection.start, composerSelection.end, composerSelection.direction);
+        input.scrollTop = composerSelection.scrollTop;
+      };
+      restore();
+      requestAnimationFrame(restore);
+    }
   }
 });
 
@@ -2017,6 +2160,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (handle.hasPointerCapture?.(event.pointerId) === true)
         handle.releasePointerCapture(event.pointerId);
       sendMessage("resize-end");
+      requestResize();
     };
 
     handle.addEventListener("pointerup", endManualResize);
@@ -2026,6 +2170,7 @@ document.addEventListener("DOMContentLoaded", () => {
         manualResizeEdge = null;
         pendingResizeMove = null;
         sendMessage("resize-end");
+        requestResize();
       }
     });
   }
@@ -2142,3 +2287,40 @@ document.addEventListener("DOMContentLoaded", () => {
   sendMessage("ready");
 });
 
+
+// Keep drag state finite even if focus or pointer capture is lost.
+let hostWindowDragging = false;
+function finishHostWindowDrag() {
+  if (!hostWindowDragging) return;
+  hostWindowDragging = false;
+  sendMessage("window-drag-end");
+}
+titlebar.addEventListener("pointerdown", event => {
+  if (event.button !== 0 || event.target.closest("button,input,textarea,a")) return;
+  titlebar.setPointerCapture(event.pointerId);
+  hostWindowDragging = true;
+  sendMessage("window-drag-start");
+});
+titlebar.addEventListener("pointermove", () => { if (hostWindowDragging) sendMessage("window-drag-move"); });
+titlebar.addEventListener("pointerup", event => {
+  finishHostWindowDrag();
+  if (titlebar.hasPointerCapture(event.pointerId)) titlebar.releasePointerCapture(event.pointerId);
+});
+titlebar.addEventListener("pointercancel", finishHostWindowDrag);
+titlebar.addEventListener("lostpointercapture", finishHostWindowDrag);
+window.addEventListener("blur", finishHostWindowDrag);
+
+// Measure after Chromium has laid out the new viewport, including delayed images.
+window.addEventListener("resize", () => requestAnimationFrame(requestResize));
+messageList.addEventListener("load", requestResize, true);
+const contentSizeObserver = new ResizeObserver(requestResize);
+contentSizeObserver.observe(composer);
+contentSizeObserver.observe(imagePreview);
+let measuredColumnWidth = 0;
+new ResizeObserver(entries => {
+  const width = Math.round(entries[0].contentRect.width);
+  if (width === measuredColumnWidth) return;
+  measuredColumnWidth = width;
+  lastSentResizeSignature = "";
+  requestAnimationFrame(() => requestAnimationFrame(requestResize));
+}).observe(document.getElementById("mainColumn"));

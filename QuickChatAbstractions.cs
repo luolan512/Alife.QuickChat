@@ -20,6 +20,9 @@ public interface IQuickChatWindow : IDisposable
     event Action<string, System.Text.Json.JsonElement>? OnMessage;
 
     bool IsWindowDragging { get; }
+    int LayoutWidth { get; }
+    long LayoutRevision { get; }
+    bool IsLayoutCurrent { get; }
 
     /// <param name="isGroup">
     /// 当前选中的是不是群聊。决定「用户手动拖过的尺寸」取哪一份（私聊和群聊分开记）。

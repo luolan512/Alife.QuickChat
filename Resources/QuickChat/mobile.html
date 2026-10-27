@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN" data-qc-surface="web"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>快聊 · 局域网</title>
+<link rel="stylesheet" href="mobile.css?v=20261028-web13"><link rel="stylesheet" href="themes.css?v=20261028-names9">
+<script src="themes.js?v=20261028-names9" defer></script><script src="mobile.js?v=20261028-web13" defer></script>
+</head><body>
+<header class="app-header">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">聊</span><div><strong>快聊</strong><small>局域网会话</small></div></div>
+  <div class="header-conversation"><strong id="chatTitle">选择一个会话</strong><span id="chatSubtitle">与桌面同步</span></div>
+  <div id="status" class="connection" role="status"><i aria-hidden="true"></i><span>正在连接</span></div>
+  <div class="mobile-actions"><button id="newRoomMobile" type="button">新建</button><button id="clearRoomMobile" type="button">清空</button></div>
+  <select id="rooms" aria-label="选择会话"></select>
+</header>
+<aside class="sidebar"><nav id="navigation" aria-label="会话列表"></nav><div class="sidebar-actions"><button id="newRoom" type="button">＋ 新建会话</button><button id="clearRoom" type="button">清空会话</button></div></aside>
+<main id="messages" aria-label="聊天记录"><div id="messageFeed" aria-live="polite"></div></main>
+<footer>
+  <div class="composer-shell">
+    <div id="notice" role="status" hidden></div>
+    <div id="pendingFiles" aria-label="待发送附件" hidden></div>
+    <div class="compose-row">
+      <button id="attach" class="icon-button" type="button" title="添加文件或图片" aria-label="添加文件或图片"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M8 12.5 14.5 6a3 3 0 0 1 4.2 4.2l-8.5 8.5a5 5 0 0 1-7.1-7.1L12 2.8M6 14.5 14.5 6"/></svg></button>
+      <input id="filePicker" type="file" multiple hidden>
+      <textarea id="text" rows="1" maxlength="4000" placeholder="发送消息，也可以拖入文件…" aria-label="消息内容"></textarea>
+      <button id="send" type="button"><span>发送</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="m5 12 14-7-5 14-2-6-7-1Z"/></svg></button>
+    </div>
+    <div class="composer-meta"><span id="typingStatus">选择会话后开始聊天</span><span class="keyboard-hint">Enter 发送 · Shift+Enter 换行</span></div>
+  </div>
+</footer>
+<div id="dropOverlay" aria-hidden="true"><div>松开，添加到当前消息<small>图片或文件 · 单个不超过 20 MB</small></div></div>
+<dialog id="clearDialog" aria-labelledby="clearTitle">
+  <h3 id="clearTitle">清空会话</h3><p id="clearDescription"></p>
+  <label class="purge-choice"><input id="purgeOriginal" type="checkbox">同时清理原始记录和相关对话上下文</label>
+  <p class="dialog-note">新建会话会保留原有记录；清空原始记录后无法恢复。</p>
+  <p id="clearError" class="dialog-error" hidden></p>
+  <div class="dialog-actions"><button id="cancelClear" type="button">取消</button><button id="confirmClear" type="button">确认清空</button></div>
+</dialog>
+</body></html>

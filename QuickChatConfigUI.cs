@@ -11,6 +11,11 @@ namespace Marisa.QuickChat;
 
 public sealed class QuickChatConfigUI : ComponentBase
 {
+    [Inject]
+    public ConfigurationSystem ConfigurationSystem { get; set; } = null!;
+
+    string? configurationSaveError;
+
     [Parameter]
     public Character? Character { get; set; }
 
@@ -61,9 +66,14 @@ public sealed class QuickChatConfigUI : ComponentBase
             // 群聊列表需要专门的编辑器（增删行、两个字段），不走通用控件。
             .Where(item => item.Name != nameof(QuickChatConfig.Groups))
             // 「流式输出」置顶（排在「启用群聊」上面），接着是群聊那两项。
-            .OrderBy(item => item.Name == nameof(QuickChatConfig.StreamingOutput) ? 0
-                : item.Name == nameof(QuickChatConfig.EnableGroupChat) ? 1
-                : item.Name == nameof(QuickChatConfig.PublicLobbyName) ? 2 : 3)
+            .OrderBy(item => item.Name == nameof(QuickChatConfig.Hotkeys) ? 0
+                : item.Name == nameof(QuickChatConfig.SimpleMode) ? 1
+                : item.Name == nameof(QuickChatConfig.ThemeStyle) ? 2
+                : item.Name == nameof(QuickChatConfig.LanEnabled) ? 3
+                : item.Name == nameof(QuickChatConfig.LanPort) ? 4
+                : item.Name == nameof(QuickChatConfig.EnableGroupChat) ? 5
+                : item.Name == nameof(QuickChatConfig.PublicLobbyName) ? 6
+                : item.Name == nameof(QuickChatConfig.StreamingOutput) ? 7 : 8)
             .ToArray();
 
         int sequence = 0;
@@ -84,6 +94,14 @@ public sealed class QuickChatConfigUI : ComponentBase
         builder.AddAttribute(sequence++, "style", "font-size:12px; line-height:1.5; color:rgba(128,128,128,.85);");
         builder.AddContent(sequence++, "在鼠标附近弹出；也可以直接用上面的全局快捷键。");
         builder.CloseElement();
+        builder.CloseElement();
+
+        builder.OpenElement(sequence++, "div");
+        builder.AddAttribute(sequence++, "role", configurationSaveError == null ? "status" : "alert");
+        builder.AddAttribute(sequence++, "style", "font-size:12px;line-height:1.6;color:" + (configurationSaveError == null ? "rgba(128,128,128,.9);" : "#ef4444;"));
+        builder.AddContent(sequence++, configurationSaveError == null
+            ? Character == null ? "修改后自动保存到全局默认配置。" : "修改后自动保存到当前角色：" + Character.Name
+            : "配置保存失败：" + configurationSaveError);
         builder.CloseElement();
 
         foreach (PropertyInfo property in properties)
@@ -111,6 +129,20 @@ public sealed class QuickChatConfigUI : ComponentBase
             }
 
             builder.CloseElement();
+            if (property.Name == nameof(QuickChatConfig.LanPort))
+            {
+        builder.OpenElement(sequence++, "p");
+        builder.AddAttribute(sequence++, "style", "font-size:13px;overflow-wrap:anywhere");
+        builder.AddContent(sequence++, Runtime?.LanInfo ?? "局域网访问未启动");
+        builder.CloseElement();
+        builder.OpenElement(sequence++, "button");
+        builder.AddAttribute(sequence++, "type", "button");
+        builder.AddAttribute(sequence++, "style", ButtonStyle);
+        builder.AddAttribute(sequence++, "onclick", EventCallback.Factory.Create(this, StateHasChanged));
+        builder.AddContent(sequence++, "刷新局域网地址");
+        builder.CloseElement();
+
+            }
             if (property.Name == nameof(QuickChatConfig.EnableGroupChat))
                 sequence = RenderGroups(builder, sequence, config);
         }
@@ -355,9 +387,19 @@ public sealed class QuickChatConfigUI : ComponentBase
         if (Configuration is not QuickChatConfig config)
             return;
 
-        if (Module is IConfigurable configurable)
-            configurable.Configuration = config;
-
+        try
+        {
+            // Updating the module alone only changes the live instance. Reopened
+            // editors load through ConfigurationSystem, so persist in that scope.
+            ConfigurationSystem.SetConfiguration(typeof(QuickChatModule), config, Character?.StorageKey ?? "");
+            if (Module is IConfigurable configurable)
+                configurable.Configuration = config;
+            configurationSaveError = null;
+        }
+        catch (Exception exception)
+        {
+            configurationSaveError = exception.Message;
+        }
         InvokeAsync(StateHasChanged);
     }
 
@@ -421,7 +463,11 @@ public sealed class QuickChatConfigUI : ComponentBase
                 builder.OpenElement(sequenceNumber++, "option");
                 builder.AddAttribute(sequenceNumber++, "value", name);
                 builder.AddAttribute(sequenceNumber++, "selected", name == selected);
-                builder.AddContent(sequenceNumber++, name);
+                builder.AddContent(sequenceNumber++, type == typeof(QuickChatTheme) ? name switch {
+                    nameof(QuickChatTheme.QQNT蓝白) => "晴空映雪",
+                    nameof(QuickChatTheme.星际幽蓝) => "星际幽蓝（动态）",
+                    _ => name
+                } : name);
                 builder.CloseElement();
             }
 
@@ -524,11 +570,7 @@ public sealed class QuickChatConfigUI : ComponentBase
             return;
 
         property.SetValue(config, value);
-
-        if (Module is IConfigurable configurable)
-            configurable.Configuration = config;
-
-        InvokeAsync(StateHasChanged);
+        CommitConfig();
     }
 
     static string GetDisplayName(PropertyInfo property)

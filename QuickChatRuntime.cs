@@ -4,11 +4,13 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
+using Alife.Function.FunctionCaller;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -39,6 +41,7 @@ public sealed class QuickChatRuntime : IDisposable
     readonly Dictionary<string, Action<ChatContext>> chatFinishedHandlers = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, Action<string>> chatSentHandlers = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, Action<string>> chatReceivedHandlers = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, Action<string>> reasoningReceivedHandlers = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, Action> chatOverHandlers = new(StringComparer.OrdinalIgnoreCase);
 
     // 流式回显：ChatBot.ChatReceived 每来一个分片就攒一次，按节流推给窗口。
@@ -50,6 +53,9 @@ public sealed class QuickChatRuntime : IDisposable
     // 这些临时气泡<b>只推窗口、不进 histories</b>：histories 里始终只有定稿后的那一条，
     // 落盘编号、翻页游标、去重全部维持原样，流式失败也不会污染历史。
     readonly Dictionary<string, StreamingTurn> streamingTurns = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> lastTurnReasoning = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, string> processConversationByPet = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<string, (XmlFunctionCaller Caller, XmlStreamExecutor Executor, Action<string, XmlContext> Handling, Action<string, Exception> Error)> toolObservers = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>流式分片两次推送之间的最小间隔。太小会把渲染层刷爆（每次都是全量重建气泡）。</summary>
     const int StreamingPushIntervalMs = 90;
@@ -141,6 +147,123 @@ public sealed class QuickChatRuntime : IDisposable
     /// <summary>公共大厅的会话 Id。它不在配置里，是隐式存在的。</summary>
     const string LobbyGroupId = "group:__lobby__";
 
+    readonly object worldGate = new();
+    Type? worldServiceType;
+    EventInfo? worldEvent;
+    Action<string>? worldHandler;
+    readonly AsyncLocal<List<QuickChatAttachment>?> worldOutgoingAttachments = new();
+
+    void ConnectWorldChat()
+    {
+        lock (worldGate)
+        {
+            if (disposed || worldEvent != null) return;
+            Type? type = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("Alife.Function.VirtualWorld.VirtualWorldService", false))
+                .FirstOrDefault(t => t != null);
+            EventInfo? evt = type?.GetEvent("BroadcastSent", BindingFlags.Public | BindingFlags.Static);
+            if (type == null || evt == null) return;
+            try
+            {
+                Action<string> handler = OnWorldBroadcast;
+                evt.AddEventHandler(null, handler);
+                worldServiceType = type;
+                worldEvent = evt;
+                worldHandler = handler;
+            }
+            catch (Exception e) { QuickChatLog.Write("连接世界群聊失败：" + e.Message); }
+        }
+    }
+
+    string WorldUserPrefix()
+    {
+        Type? type = worldServiceType?.Assembly.GetType("Alife.Function.VirtualWorld.GroupChatLog");
+        return type?.GetProperty("MessagePrefix", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) as string
+            ?? "[来自管理员的广播消息]";
+    }
+
+    void SendWorldBroadcast(string text, string? sender, List<QuickChatAttachment>? attachments = null)
+    {
+        ConnectWorldChat();
+        Type type = worldServiceType ?? throw new InvalidOperationException("世界群聊未加载，请先启用虚拟世界模块。");
+        var targets = chatActivitySystem.GetAllChatActivities().Select(a => a.Character)
+            .Where(c => c.Modules.Contains(ModuleSystem.GetModuleId(type)))
+            .Where(c => sender == null || !string.Equals(c.Name, sender, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (targets.Length == 0 && sender == null)
+            throw new InvalidOperationException("没有启用虚拟世界的在线角色，无法发送世界群聊消息。");
+        string full = sender == null ? WorldUserPrefix() + text : $"[来自{sender}的广播消息]{text}";
+        MethodInfo method = type.GetMethod("BroadcastMessage", BindingFlags.Public | BindingFlags.Static)
+            ?? throw new InvalidOperationException("当前虚拟世界版本不支持广播接口。");
+        // 世界群聊页面仅靠 ownPending 判断用户消息的左右位置；发送前登记，
+        // 让它自己的事件处理器按原有逻辑认领，不能改写官方页面或重复加记录。
+        if (sender == null)
+        {
+            FieldInfo? field = type.GetField("BroadcastSent", BindingFlags.Static | BindingFlags.NonPublic);
+            if (field?.GetValue(null) is Delegate subscribers)
+                foreach (Delegate subscriber in subscribers.GetInvocationList())
+                {
+                    object? page = subscriber.Target;
+                    if (page?.GetType().FullName != "Alife.Function.VirtualWorld.VirtualWorldGlobalUI") continue;
+                    var pending = page.GetType().GetField("ownPending", BindingFlags.Instance | BindingFlags.NonPublic)
+                        ?.GetValue(page) as List<(string Full, string Clean, DateTime Time)>;
+                    if (pending == null) continue;
+                    lock (pending) pending.Add((full, text, DateTime.Now));
+                }
+        }
+        worldOutgoingAttachments.Value = attachments;
+        try { method.Invoke(null, new object[] { full, targets, chatActivitySystem }); }
+        finally { worldOutgoingAttachments.Value = null; }
+    }
+
+    void OnWorldBroadcast(string message)
+    {
+        try
+        {
+            if (disposed || !config.EnableGroupChat || store == null) return;
+            string text = message ?? "";
+            QuickChatPrincipal sender = QuickChatPrincipal.Human;
+            const string head = "[来自";
+            const string tail = "的广播消息]";
+            string prefix = WorldUserPrefix();
+            if (!string.IsNullOrEmpty(prefix) && text.StartsWith(prefix, StringComparison.Ordinal))
+                text = text.Substring(prefix.Length);
+            else if (text.StartsWith(head, StringComparison.Ordinal))
+            {
+                int end = text.IndexOf(tail, head.Length, StringComparison.Ordinal);
+                if (end > head.Length)
+                {
+                    sender = QuickChatPrincipal.Agent(text.Substring(head.Length, end - head.Length));
+                    text = text.Substring(end + tail.Length);
+                }
+            }
+            if (worldOutgoingAttachments.Value is { Count: > 0 } outgoingFiles) {
+                text = QuickChatContentFilter.CleanOutgoingDisplayText(text, outgoingFiles.Select(a => a.Path));
+                if (string.IsNullOrWhiteSpace(text)) text = "[附件]";
+            }
+            if (string.IsNullOrWhiteSpace(text)) return;
+            // The official page normally owns its in-memory log. When no page is
+            // subscribed, retain the broadcast for the next time the page opens.
+            try
+            {
+                FieldInfo? eventField = worldServiceType?.GetField("BroadcastSent", BindingFlags.Static | BindingFlags.NonPublic);
+                if (eventField != null && eventField.GetValue(null) is Delegate subscribers &&
+                    !subscribers.GetInvocationList().Any(d => d.Target?.GetType().FullName == "Alife.Function.VirtualWorld.VirtualWorldGlobalUI"))
+                {
+                    Type? log = worldServiceType?.Assembly.GetType("Alife.Function.VirtualWorld.GroupChatLog");
+                    log?.GetMethod("Add", BindingFlags.Public | BindingFlags.Static)?.Invoke(null,
+                        new object?[] { sender.IsHuman ? "管理员" : sender.AgentName, text, sender.IsHuman });
+                }
+            }
+            catch (Exception e) { QuickChatLog.Write("补充世界群聊记录失败：" + e.Message); }
+            SyncStoreConversations();
+            ChatRecord record = store.Send(LobbyGroupId, sender, text, persist: config.SaveGroupMessages);
+            AddRecordMessage(record, sender.IsHuman ? "user" : "assistant", worldOutgoingAttachments.Value, "sent");
+            SendState();
+        }
+        catch (Exception e) { QuickChatLog.Write("同步世界群聊失败：" + e); }
+    }
+
     /// <summary>
     /// 多开私聊会话 Id 的前缀。
     /// <para>
@@ -216,10 +339,78 @@ public sealed class QuickChatRuntime : IDisposable
     // 私聊会话的 Id 就是角色名（petId），所以历史键与旧行为完全兼容；
     // 群聊会话的 Id 形如 "group:群名"。
     string? selectedConversationId;
+    long layoutGeneration;
     string configSignature = string.Empty;
     bool hasAppliedConfig;
     int referenceCount;
     bool disposed;
+    readonly SemaphoreSlim lanGate = new(1, 1);
+    QuickChatLanServer? lanServer;
+    string lanError = "";
+    public string LanInfo => lanServer == null ? (string.IsNullOrEmpty(lanError) ? "局域网访问未启动" : "局域网访问启动失败：" + lanError)
+        : "局域网网页地址：" + string.Join("　", QuickChatLanServer.Addresses(lanServer.Port));
+
+    async Task ConfigureLanAsync()
+    {
+        await lanGate.WaitAsync();
+        try
+        {
+            if (lanServer != null && (disposed || !config.LanEnabled || lanServer.Port != config.LanPort))
+            { await lanServer.DisposeAsync(); lanServer = null; }
+            if (disposed || !config.LanEnabled || lanServer != null) return;
+            try {
+                string page = Path.Combine(pluginSystem.PluginContext.GetPluginDirectoryPath("Marisa.QuickChat"), "Resources", "QuickChat", "mobile.html");
+                var server = new QuickChatLanServer(page, LanConversations, LanHistory, SendMessageFromLanAsync, LanAttachmentPath, Path.Combine(pluginSystem.PluginContext.GetPluginDirectoryPath("Marisa.QuickChat"), "Temp", "Images")) {
+                    CreateConversation = id => CreateConversationCore(id, false),
+                    ClearConversation = (id, purge) => ClearDisplayedHistory(id, purge)
+                };
+                await server.StartAsync(config.LanPort); lanServer = server; lanError = "";
+            }
+            catch (Exception e) { lanError = e.Message; QuickChatLog.Write("局域网访问启动失败：" + e); }
+        }
+        finally { lanGate.Release(); }
+    }
+
+    object LanConversations()
+    {
+        lock (stateGate)
+            return BuildConversations().Select(c => new { c.Id, c.Title, c.Kind, c.Members, c.Busy, ClearIncludesOriginal = config.ClearIncludesOriginal, SimpleMode = config.SimpleMode, ThemeStyle = config.ThemeStyle.ToString() }).ToArray();
+    }
+    object? LanHistory(string id)
+    {
+        lock (stateGate)
+            if (!BuildConversations().Any(c => string.Equals(c.Id, id, StringComparison.OrdinalIgnoreCase))) return null;
+        EnsureHistoryLoaded(id);
+        lock (stateGate)
+        {
+            List<object> result = histories.TryGetValue(id, out var items)
+                ? items.Select(m => (object)new { m.Id, m.Role, m.PetId, m.SenderName, m.Text, m.Reasoning, m.ActivityTitle, m.ActivityKind, m.CreatedAt, m.DeliveryState, Attachments = m.Attachments.Select((a, index) => new { a.Kind, a.Name, Available = File.Exists(a.Path), Url = "/api/attachment?conversationId=" + Uri.EscapeDataString(id) + "&messageId=" + Uri.EscapeDataString(m.Id) + "&index=" + index }).ToArray() }).ToList()
+                : new List<object>();
+            foreach (var entry in streamingTurns.Where(e => e.Value.ConversationId.Equals(id, StringComparison.OrdinalIgnoreCase) && e.Value.StreamingEnabled))
+            {
+                string text = entry.Value.IsGroup ? "" : QuickChatContentFilter.CleanStreamingText(entry.Value.Buffer.ToString());
+                string reasoning = entry.Value.Reasoning.ToString().Substring(Math.Min(entry.Value.ReasoningFlushed, entry.Value.Reasoning.Length));
+                if (text.Length == 0 && reasoning.Length == 0) continue;
+                bool thoughtOnly = text.Length == 0;
+                result.Add(new { Id = entry.Value.MessageId, Role = thoughtOnly ? "activity" : "assistant", PetId = entry.Key, SenderName = entry.Key, Text = thoughtOnly ? reasoning : text, Reasoning = thoughtOnly ? "" : reasoning, ActivityTitle = "思考过程 · 进行中", ActivityKind = "process", CreatedAt = entry.Value.StartedAt });
+            }
+            return result;
+        }
+    }
+    string? LanAttachmentPath(string conversationId, string messageId, int index)
+    {
+        lock (stateGate) {
+            if (!histories.TryGetValue(conversationId, out var history)) return null;
+            var message = history.FirstOrDefault(m => m.Id == messageId);
+            return message != null && index >= 0 && index < message.Attachments.Count ? message.Attachments[index].Path : null;
+        }
+    }
+    Task SendMessageFromLanAsync(string id, string text, string[] paths)
+    {
+        if (paths.Length > 0)
+            text = "用户发送了" + paths.Length + "个文件：\n" + string.Join("\n", paths) + "\n\n用户文字：\n" + text;
+        return SendMessageAsync(id, text, paths);
+    }
 
     QuickChatRuntime(
         ChatActivitySystem chatActivitySystem,
@@ -231,8 +422,8 @@ public sealed class QuickChatRuntime : IDisposable
         this.chatActivitySystem = chatActivitySystem;
         this.pluginSystem = pluginSystem;
         this.logger = logger;
-        this.windowFactory = windowFactory ?? new ElectronQuickChatWindowFactory();
-        this.shortcutService = shortcutService ?? new ElectronQuickChatShortcutService(logger);
+        this.windowFactory = windowFactory ?? throw new ArgumentNullException(nameof(windowFactory));
+        this.shortcutService = shortcutService ?? throw new ArgumentNullException(nameof(shortcutService));
 
         // 落盘根目录放在插件自己的数据区，和 Alife 的 Storage 并列但不混进角色目录。
         dataRoot = Path.Combine(Alife.Foundation.AlifePath.StorageFolderPath, "QuickChat");
@@ -259,8 +450,7 @@ public sealed class QuickChatRuntime : IDisposable
         ChatActivitySystem chatActivitySystem,
         PluginSystem pluginSystem,
         ILogger<QuickChatModule> logger,
-        IQuickChatWindowFactory? windowFactory = null,
-        IQuickChatShortcutService? shortcutService = null)
+        IAlifeApplication app)
     {
         lock (CurrentGate)
         {
@@ -269,8 +459,8 @@ public sealed class QuickChatRuntime : IDisposable
                     chatActivitySystem,
                     pluginSystem,
                     logger,
-                    windowFactory,
-                    shortcutService);
+                    new AlifeQuickChatWindowFactory(app),
+                    new WindowsQuickChatShortcutService(logger));
 
             return current;
         }
@@ -328,6 +518,7 @@ public sealed class QuickChatRuntime : IDisposable
 
     public void ApplyConfig(QuickChatConfig value, object? source)
     {
+        ConnectWorldChat();
         QuickChatConfig normalized = NormalizeConfig(value);
 
         lock (configGate)
@@ -364,6 +555,7 @@ public sealed class QuickChatRuntime : IDisposable
         }
 
         RegisterHotkeys();
+        _ = ConfigureLanAsync();
         SyncStoreConversations();
         RefreshAllPrompts();
         ApplyConversationWindowSize();
@@ -415,15 +607,18 @@ public sealed class QuickChatRuntime : IDisposable
         Action<ChatContext> handler = context => OnChatFinished(petId, context);
         Action<string> sentHandler = text => OnChatSent(petId, text);
         Action<string> receivedHandler = text => OnChatReceived(petId, text);
+        Action<string> reasoningHandler = text => OnReasoningReceived(petId, text);
         Action overHandler = () => OnChatOver(petId);
         activity.ChatBot.ChatFinished += handler;
         activity.ChatBot.ChatSent += sentHandler;
         activity.ChatBot.ChatReceived += receivedHandler;
+        activity.ChatBot.ReasoningReceived += reasoningHandler;
         activity.ChatBot.ChatOver += overHandler;
         subscribedBots[petId] = activity.ChatBot;
         chatFinishedHandlers[petId] = handler;
         chatSentHandlers[petId] = sentHandler;
         chatReceivedHandlers[petId] = receivedHandler;
+        reasoningReceivedHandlers[petId] = reasoningHandler;
         chatOverHandlers[petId] = overHandler;
 
         if (promptInteractors.ContainsKey(petId) == false)
@@ -465,6 +660,9 @@ public sealed class QuickChatRuntime : IDisposable
             if (chatReceivedHandlers.Remove(petId, out Action<string>? receivedHandler))
                 bot.ChatReceived -= receivedHandler;
 
+            if (reasoningReceivedHandlers.Remove(petId, out Action<string>? reasoningHandler))
+                bot.ReasoningReceived -= reasoningHandler;
+
             if (chatOverHandlers.Remove(petId, out Action? overHandler))
                 bot.ChatOver -= overHandler;
         }
@@ -487,6 +685,113 @@ public sealed class QuickChatRuntime : IDisposable
         }
     }
 
+    public void AttachToolEvents(string petId, XmlFunctionCaller caller)
+    {
+        lock (stateGate)
+        {
+            if (disposed || toolObservers.ContainsKey(petId)) return;
+            var executor = typeof(XmlFunctionCaller).GetField("executor", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(caller) as XmlStreamExecutor;
+            if (executor == null) return; // 函数调用器在 OnStart 才创建执行器。
+            Action<string, XmlContext> handling = (name, context) => OnToolHandling(petId, name, context);
+            Action<string, Exception> error = (name, exception) => AddActivityForPet(petId, "工具出错 · " + name, exception.Message);
+            executor.Handling += handling;
+            executor.Error += error;
+            toolObservers[petId] = (caller, executor, handling, error);
+        }
+    }
+
+    public void DetachToolEvents(string petId, XmlFunctionCaller caller)
+    {
+        lock (stateGate)
+        {
+            if (!toolObservers.TryGetValue(petId, out var observer) || !ReferenceEquals(observer.Caller, caller)) return;
+            observer.Executor.Handling -= observer.Handling;
+            observer.Executor.Error -= observer.Error;
+            toolObservers.Remove(petId);
+        }
+    }
+
+    void OnToolHandling(string petId, string name, XmlContext context)
+    {
+        // Broadcast is a speaking channel; its delivered content is synchronized
+        // by OnWorldBroadcast, rather than duplicated as a tool activity.
+        if (name.Equals("Speak", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("Broadcast", StringComparison.OrdinalIgnoreCase)) return;
+        if (context.CallMode == CallMode.Closing)
+        {
+            string content = context is XmlExecutorContext executorContext ? executorContext.FullContent : context.Content;
+            if (!string.IsNullOrWhiteSpace(content)) AddActivityForPet(petId, "工具输入 · " + name, content);
+            return;
+        }
+        if (context.CallMode != CallMode.Opening && context.CallMode != CallMode.OneShot) return;
+        FlushThoughtForPet(petId);
+        string arguments = string.Join("\n", context.Parameters.Where(p => !p.Key.StartsWith("#", StringComparison.Ordinal)).Select(p => p.Key + ": " + p.Value));
+        if (!string.IsNullOrWhiteSpace(context.Content)) arguments += (arguments.Length == 0 ? "" : "\n") + context.Content;
+        AddActivityForPet(petId, "调用工具 · " + name, arguments);
+    }
+
+    void AddActivityForPet(string petId, string title, string text)
+    {
+        string conversation;
+        lock (stateGate)
+            conversation = processConversationByPet.TryGetValue(petId, out var target) ? target : petId;
+        AddActivity(conversation, petId, title, text);
+    }
+
+    void AddActivity(string conversationId, string petId, string title, string text)
+        => AddActivityCore(conversationId, petId, title, text, "process");
+
+    void AddActivityCore(string conversationId, string petId, string title, string text, string activityKind)
+    {
+        try
+        {
+            if (disposed) return;
+            string detail = string.IsNullOrWhiteSpace(text) ? "（无详情）" : text.Trim();
+            int offset = 0, partNumber = 0;
+            while (offset < detail.Length)
+            {
+                int length = Math.Min(3900, detail.Length - offset);
+                if (offset + length < detail.Length && char.IsHighSurrogate(detail[offset + length - 1])) length--;
+                string part = detail.Substring(offset, length);
+                string partTitle = detail.Length > 3900 ? title + " · 第 " + (++partNumber) + " 段" : title;
+                if (string.IsNullOrWhiteSpace(part)) { offset += length; continue; }
+                QuickChatPrincipal sender = activityKind == "system_event" ? QuickChatPrincipal.System : QuickChatPrincipal.Agent(petId);
+                ChatRecord? record = store?.Send(conversationId, sender, part, contentType: "activity",
+                    persist: IsGroupConversationId(conversationId) ? config.SaveGroupMessages : GetConfigForPet(petId).SaveDirectMessages,
+                    activityTitle: partTitle, activityActorId: petId, activityKind: activityKind);
+                AddMessage(petId, "activity", part, id: record == null ? null : MessageIdOf(record), conversationId: conversationId, activityTitle: partTitle, activityKind: activityKind);
+                offset += length;
+            }
+            SendState();
+        }
+        catch (Exception e) { QuickChatLog.Write("记录对话过程失败：" + e.Message); }
+    }
+
+    void FlushThoughtForPet(string petId)
+    {
+        StreamingTurn? turn;
+        lock (stateGate) streamingTurns.TryGetValue(petId, out turn);
+        FlushThought(petId, turn);
+    }
+
+    void FlushThought(string petId, StreamingTurn? turn)
+    {
+        if (turn == null) return;
+        string part;
+        lock (stateGate)
+        {
+            string full = turn.Reasoning.ToString();
+            part = full.Substring(Math.Min(turn.ReasoningFlushed, full.Length)).Trim();
+            turn.ReasoningFlushed = full.Length;
+        }
+        if (part.Length > 0)
+        {
+            AddActivity(turn.ConversationId, petId, "思考过程", part);
+            RemoveStreamingMessage(turn);
+            lock (stateGate) turn.Pushed = false;
+        }
+    }
+
     void OnChatSent(string petId, string? rawMessage)
     {
         if (string.IsNullOrWhiteSpace(rawMessage))
@@ -502,7 +807,14 @@ public sealed class QuickChatRuntime : IDisposable
         //   群聊的文字输出不是发言（要发言得用 QuickChatSend），落进去会把
         //   「没发出去的话」写进群记录；无信封的注入则没有明确对象，维持旧的丢弃行为。
         string? sentKind = QuickChatEnvelope.KindOf(rawMessage);
-        if (sentKind != null && sentKind.Equals("tool", StringComparison.OrdinalIgnoreCase))
+        bool boardInput = sentKind == null && QuickChatContentFilter.TryExtractChatWindowText(rawMessage, out _);
+        var incoming = QuickChatContentFilter.ClassifyIncomingActivities(rawMessage);
+        bool pluginContinuation = sentKind == null && !boardInput && incoming.Count > 0
+            && incoming.All(item => item.Kind == "process" && item.Title != "外部输入");
+        string? priorConversation = null;
+        if (pluginContinuation)
+            lock (stateGate) processConversationByPet.TryGetValue(petId, out priorConversation);
+        if ((sentKind != null && sentKind.Equals("tool", StringComparison.OrdinalIgnoreCase)) || pluginContinuation)
         {
             // 保留落点，什么都不做。
         }
@@ -528,10 +840,32 @@ public sealed class QuickChatRuntime : IDisposable
 
         // 本轮流式回显落到哪个会话，必须在这里就定下来：
         // ClaimPendingOutgoing 会把登记项取走，晚一步就拿不到 ConversationId 了。
-        BeginStreamingTurn(petId, rawMessage, claimed ? pending?.ConversationId : null);
+        BeginStreamingTurn(petId, rawMessage, claimed ? pending?.ConversationId : priorConversation);
 
         if (claimed == false)
+        {
+            if (sentKind == null && QuickChatContentFilter.TryExtractChatWindowText(rawMessage, out string boardText))
+            {
+                SyncStoreConversations();
+                ChatRecord? boardRecord = TryPersistDirectMessage(petId, QuickChatPrincipal.Human, boardText, GetConfigForPet(petId).SaveDirectMessages);
+                AddMessage(UserSpeakerId, "user", boardText, id: boardRecord == null ? null : MessageIdOf(boardRecord), conversationId: petId);
+                SendState();
+                return;
+            }
+            // 群聊投递已经在群里有消息，不能再复制到私聊；其他来源作为过程消息保留。
+            bool worldBroadcast = IsWorldBroadcast(rawMessage);
+            if (!worldBroadcast && (sentKind == null || sentKind.Equals("tool", StringComparison.OrdinalIgnoreCase)))
+            {
+                string conversation;
+                lock (stateGate) conversation = processConversationByPet.TryGetValue(petId, out var target) ? target : petId;
+                if (sentKind != null)
+                    AddActivityCore(conversation, petId, "工具返回", rawMessage, "process");
+                else
+                    foreach (var item in incoming)
+                        AddActivityCore(conversation, petId, item.Title, item.Text, item.Kind);
+            }
             return;
+        }
 
         // 能走到这里说明本条已经进入对话上下文（ChatSent 在装载历史之后触发），
         // 把本地乐观气泡从「发送中」翻成「已送达」。
@@ -548,6 +882,10 @@ public sealed class QuickChatRuntime : IDisposable
         string? kind = QuickChatEnvelope.KindOf(rawMessage);
         return kind != null && kind.Equals("tool", StringComparison.OrdinalIgnoreCase);
     }
+
+    bool IsWorldBroadcast(string? text) => !string.IsNullOrEmpty(text) &&
+        (text.Contains("的广播消息]", StringComparison.Ordinal) ||
+         (!string.IsNullOrEmpty(WorldUserPrefix()) && text.Contains(WorldUserPrefix(), StringComparison.Ordinal)));
 
     void ClearToolReplyTarget(string petId)
     {
@@ -584,34 +922,37 @@ public sealed class QuickChatRuntime : IDisposable
         // 只读不取：落点的生命周期由 OnChatSent 管，这里取走的话
         // 「连着翻两次记录」的第二次就没落点了（见 toolReplyTargets）。
         string? toolTarget = null;
+        string? previousTarget = null;
         if (toolRound)
         {
             lock (stateGate)
+            {
                 toolReplyTargets.TryGetValue(petId, out toolTarget);
+                processConversationByPet.TryGetValue(petId, out previousTarget);
+            }
         }
 
-        bool streamable = enabled
-            && (kind == null
-                || (kind.Equals("group", StringComparison.OrdinalIgnoreCase) == false
-                    && (toolRound == false || string.IsNullOrWhiteSpace(toolTarget) == false)));
+        bool isWorld = IsWorldBroadcast(rawMessage);
+        bool isGroupTurn = isWorld || (kind != null && kind.Equals("group", StringComparison.OrdinalIgnoreCase)) ||
+            (toolRound && IsGroupConversationId(toolTarget ?? previousTarget)) || IsGroupConversationId(pendingConversationId);
 
+        StreamingTurn? previousTurn;
         lock (stateGate)
         {
             // 上一轮如果没走完（被新消息打断），旧状态在这里丢掉；
             // 它留在前端的那半个气泡由前端收到新分片时自己清。
+            streamingTurns.TryGetValue(petId, out previousTurn);
             streamingTurns.Remove(petId);
+            lastTurnReasoning.Remove(petId);
 
-            if (streamable == false)
-                return;
-
-            string conversationId = QuickChatEnvelope.ConversationOf(rawMessage)
-                // 工具返回信封里没有 conv=（见 QuickChatEnvelope.EncodeToolResult），
-                // 落点只能靠刚才那次翻记录记下来的目标。
+            string conversationId = (isWorld ? LobbyGroupId : QuickChatEnvelope.ConversationOf(rawMessage))
                 ?? (string.IsNullOrWhiteSpace(toolTarget) ? null : toolTarget)
+                ?? (toolRound && !string.IsNullOrWhiteSpace(previousTarget) ? previousTarget : null)
                 ?? (string.IsNullOrWhiteSpace(pendingConversationId) ? petId : pendingConversationId);
-
-            streamingTurns[petId] = new StreamingTurn(conversationId);
+            streamingTurns[petId] = new StreamingTurn(conversationId, enabled, isGroupTurn);
+            processConversationByPet[petId] = conversationId;
         }
+        RemoveStreamingMessage(previousTurn);
     }
 
     /// <summary>
@@ -633,6 +974,7 @@ public sealed class QuickChatRuntime : IDisposable
                 return;
 
             turn.Buffer.Append(chunk);
+            if (!turn.StreamingEnabled || turn.IsGroup) return;
 
             // 第一个分片立刻推（用户马上就能看到反应），之后按 StreamingPushIntervalMs 节流。
             // 每次推送前端都会整段重建气泡，推太密只会换来卡顿。
@@ -640,7 +982,7 @@ public sealed class QuickChatRuntime : IDisposable
             if (turn.Pushed && now - turn.LastPushTicks < StreamingPushIntervalMs)
                 return;
 
-            text = QuickChatContentFilter.CleanStreamingText(turn.Buffer.ToString());
+            text = turn.IsGroup ? "" : QuickChatContentFilter.CleanStreamingText(turn.Buffer.ToString());
             if (text.Length == 0)
                 return;
 
@@ -651,6 +993,27 @@ public sealed class QuickChatRuntime : IDisposable
         }
 
         PushStreamingMessage(petId, conversationId, messageId, text, streaming: true);
+    }
+
+    void OnReasoningReceived(string petId, string? chunk)
+    {
+        if (string.IsNullOrEmpty(chunk)) return;
+        string conversationId, messageId, text, reasoning;
+        lock (stateGate)
+        {
+            if (!streamingTurns.TryGetValue(petId, out StreamingTurn? turn)) return;
+            turn.Reasoning.Append(chunk);
+            if (!turn.StreamingEnabled) return;
+            long now = Environment.TickCount64;
+            if (turn.Pushed && now - turn.LastPushTicks < StreamingPushIntervalMs) return;
+            text = turn.IsGroup ? "" : QuickChatContentFilter.CleanStreamingText(turn.Buffer.ToString());
+            reasoning = turn.Reasoning.ToString().Substring(Math.Min(turn.ReasoningFlushed, turn.Reasoning.Length));
+            turn.Pushed = true;
+            turn.LastPushTicks = now;
+            conversationId = turn.ConversationId;
+            messageId = turn.MessageId;
+        }
+        PushStreamingMessage(petId, conversationId, messageId, text, streaming: true, reasoning);
     }
 
     /// <summary>
@@ -677,6 +1040,8 @@ public sealed class QuickChatRuntime : IDisposable
             if (streamingTurns.TryGetValue(petId, out StreamingTurn? turn) == false)
                 return;
 
+            if (!turn.StreamingEnabled || turn.IsGroup) return;
+
             text = QuickChatContentFilter.CleanStreamingText(turn.Buffer.ToString());
             if (text.Length == 0)
                 return;
@@ -689,13 +1054,19 @@ public sealed class QuickChatRuntime : IDisposable
     }
 
     /// <summary>把一条临时气泡推给窗口。可见性规则和 <see cref="AddMessage"/> 保持一致。</summary>
-    void PushStreamingMessage(string petId, string conversationId, string messageId, string text, bool streaming)
+    void PushStreamingMessage(string petId, string conversationId, string messageId, string text, bool streaming, string? reasoning = null)
     {
         // 只推当前选中的会话。别的会话等用户切过去时，从 histories 拿到的是定稿那条。
         if (string.Equals(selectedConversationId, conversationId, StringComparison.OrdinalIgnoreCase) == false)
             return;
 
-        window?.Send("message", BuildStreamingPayload(petId, conversationId, messageId, text, streaming));
+        if (reasoning == null)
+        {
+            lock (stateGate)
+                if (streamingTurns.TryGetValue(petId, out var turn) && turn.MessageId == messageId)
+                    reasoning = turn.Reasoning.ToString().Substring(Math.Min(turn.ReasoningFlushed, turn.Reasoning.Length));
+        }
+        window?.Send("message", BuildStreamingPayload(petId, conversationId, messageId, text, streaming, reasoning));
     }
 
     /// <summary>
@@ -706,7 +1077,7 @@ public sealed class QuickChatRuntime : IDisposable
     /// 定稿用的是落盘编号，和这里的临时 id 不同，不撤就会同一句话显示两遍。</item>
     /// </list>
     /// </summary>
-    object BuildStreamingPayload(string petId, string conversationId, string messageId, string text, bool streaming)
+    object BuildStreamingPayload(string petId, string conversationId, string messageId, string text, bool streaming, string? reasoning = null)
     {
         ChatActivity? activity = chatActivitySystem.GetAllChatActivities()
             .FirstOrDefault(item => item.Character.Name == petId);
@@ -715,13 +1086,16 @@ public sealed class QuickChatRuntime : IDisposable
         return new
         {
             id = messageId,
-            role = "assistant",
+            role = string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(reasoning) ? "activity" : "assistant",
             petId,
             petName,
             senderName = petName,
             conversationId,
             kind = IsGroupConversationId(conversationId) ? "group" : "dm",
-            text,
+            text = string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(reasoning) ? reasoning : text,
+            reasoning = string.IsNullOrWhiteSpace(text) ? "" : reasoning ?? "",
+            activityTitle = "思考过程",
+            activityKind = "process",
             deliveryState = string.Empty,
             attachments = Array.Empty<QuickChatAttachment>(),
             streaming,
@@ -736,17 +1110,24 @@ public sealed class QuickChatRuntime : IDisposable
     /// </summary>
     sealed class StreamingTurn
     {
-        public StreamingTurn(string conversationId)
+        public StreamingTurn(string conversationId, bool streamingEnabled, bool isGroup)
         {
             ConversationId = conversationId;
+            StreamingEnabled = streamingEnabled;
+            IsGroup = isGroup;
             MessageId = "stream:" + Guid.NewGuid().ToString("N");
         }
 
         public string ConversationId { get; }
+        public bool StreamingEnabled { get; }
+        public bool IsGroup { get; }
 
         public string MessageId { get; }
+        public DateTimeOffset StartedAt { get; } = DateTimeOffset.Now;
 
         public StringBuilder Buffer { get; } = new();
+        public StringBuilder Reasoning { get; } = new();
+        public int ReasoningFlushed { get; set; }
 
         /// <summary>这一轮是否已经推过至少一个分片。没推过就说明气泡还没出现过，定稿时无需收尾。</summary>
         public bool Pushed { get; set; }
@@ -758,8 +1139,21 @@ public sealed class QuickChatRuntime : IDisposable
     {
         // 这一轮结束了，流式回显到此为止。先摘掉状态再分流：之后万一还有迟到的分片，
         // 也不会在定稿气泡后面又冒出一个临时气泡。
+        StreamingTurn? finishedTurn;
+        lock (stateGate) streamingTurns.TryGetValue(petId, out finishedTurn);
+        FlushThought(petId, finishedTurn);
+        string taggedThought = QuickChatContentFilter.ExtractThoughtText(context.AIMessage);
+        if (!string.IsNullOrWhiteSpace(taggedThought) && finishedTurn != null)
+            AddActivity(finishedTurn.ConversationId, petId, "思考过程", taggedThought);
         lock (stateGate)
+        {
+            streamingTurns.TryGetValue(petId, out finishedTurn);
             streamingTurns.Remove(petId);
+            string native = finishedTurn?.Reasoning.ToString().Trim() ?? "";
+            string tagged = QuickChatContentFilter.ExtractThoughtText(context.AIMessage);
+            string thought = string.Join("\n", new[] { native, tagged }.Where(s => !string.IsNullOrWhiteSpace(s)));
+            if (thought.Length > 0) lastTurnReasoning[petId] = thought;
+        }
 
         // 按信封里的 kind 分流，而不是「有没有信封」——私聊现在也带信封（kind=dm），
         // 继续用「有信封 = 群聊」判断，会把私聊的回复误当成群聊轮次丢掉，私聊就再也不显示回复了。
@@ -767,41 +1161,31 @@ public sealed class QuickChatRuntime : IDisposable
 
         // 群聊投递引发的轮次：模型的文字输出不是群消息，只有 QuickChatSend 才发言。
         // 所以这里既不把它塞进私聊流，也不做「已送达」收尾，只检查漏回复。
-        if (kind != null && kind.Equals("group", StringComparison.OrdinalIgnoreCase))
+        if ((kind != null && kind.Equals("group", StringComparison.OrdinalIgnoreCase)) || finishedTurn?.IsGroup == true)
         {
+            RemoveStreamingMessage(finishedTurn);
             CheckMissingGroupReply(petId, context);
             return;
         }
 
-        // 工具返回值引发的轮次：模型那段文字是在「处理工具返回」，不是在跟谁说话，
-        // 所以默认哪儿都不该落。
-        //
-        // 不拦的话它会落到下面的 `?? petId` —— 也就是**这个角色和主人的默认私聊**。
-        // 实测就是这么漏的：小睦用 QuickChatDirect 给酒狐发了私聊，紧接着工具返回值
-        // 唤起了下一轮，她顺手说了一句「……嗯，收到了。测试成功。谢谢你，酒狐。」，
-        // 那句话就出现在了主人的窗口里 —— 主人看到的就是「她跟别人私聊，话却发给了我」。
-        //
-        // 工具返回值信封里没有 conv=（见 QuickChatEnvelope.EncodeToolResult），
-        // 没法反推该落哪儿；而且真要发言就该调 QuickChatSend，那一轮才算发言。
-        //
-        // 但有一个必须放行的例外：**刚翻过某个会话**的那一轮。模型调 QuickChatRead
-        // 之后，读结果要先投回去它才能接着说话，所以真正的回答是在这一轮说出来的 ——
-        // 照上面一刀切掉的话，用户问了它一句，快聊里永远什么都不出现，
-        // 而且它每轮都调 QuickChatRead 的话就永远不出现（看起来就是「卡死了」）。
-        //
-        // 落点由 ReadForAgent / OnChatSent 维护在 toolReplyTargets 里，这里只读不取：
-        // 模型可能连着翻好几次（「还有更早的」），取走一次的话第二次之后又会开始丢。
-        // 落点的生命周期由 OnChatSent 按 kind 管：私聊轮重新指向、群聊和无信封的注入清掉。
+        // 工具返回轮优先继承记录过的会话，没有专用落点时使用当前轮的会话。
+        // 群聊仍必须通过群聊发送接口发言，不把普通文本误投到私聊。
         if (kind != null && kind.Equals("tool", StringComparison.OrdinalIgnoreCase))
         {
             string? target;
             lock (stateGate)
                 toolReplyTargets.TryGetValue(petId, out target);
 
-            // 没有落点 → 维持原样整轮丢弃。绝不能回落到 `?? petId`：
-            // 那正是上面那段注释里记录的跨频道事故。
-            if (string.IsNullOrWhiteSpace(target) == false)
-                _ = AddAssistantMessageAsync(petId, target, context);
+            target ??= finishedTurn?.ConversationId;
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                lock (stateGate) processConversationByPet.TryGetValue(petId, out target);
+                target ??= petId;
+            }
+            if (string.IsNullOrWhiteSpace(target) == false && !IsGroupConversationId(target))
+                _ = AddAssistantMessageAsync(petId, target, context, finishedTurn);
+            else
+                RemoveStreamingMessage(finishedTurn);
 
             return;
         }
@@ -811,8 +1195,24 @@ public sealed class QuickChatRuntime : IDisposable
         // 落到哪个会话必须看信封里的 conv=，不能默认用角色名：一个角色可以有多条私聊线
         // （默认私聊 ID = 角色名，用户「新建」出来的是 dm:小梦#2）。不认 conv= 的话，
         // 在 #2 里问的话，回答会跑到默认私聊里去。
-        string conversationId = QuickChatEnvelope.ConversationOf(context.UserMessage) ?? petId;
-        _ = AddAssistantMessageAsync(petId, conversationId, context);
+        string conversationId = QuickChatEnvelope.ConversationOf(context.UserMessage) ?? finishedTurn?.ConversationId ?? petId;
+        _ = AddAssistantMessageAsync(petId, conversationId, context, finishedTurn);
+    }
+
+    void RemoveStreamingMessage(StreamingTurn? turn)
+    {
+        if (turn?.Pushed == true)
+            window?.Send("stream-end", new { conversationId = turn.ConversationId, id = turn.MessageId });
+    }
+
+    string ReasoningForAgent(string petId)
+    {
+        lock (stateGate)
+        {
+            if (streamingTurns.TryGetValue(petId, out var turn))
+                return string.Join("\n", new[] { turn.Reasoning.ToString(), QuickChatContentFilter.ExtractThoughtText(turn.Buffer.ToString()) }.Where(s => !string.IsNullOrWhiteSpace(s)));
+            return lastTurnReasoning.TryGetValue(petId, out var thought) ? thought : "";
+        }
     }
 
     /// <summary>
@@ -874,10 +1274,9 @@ public sealed class QuickChatRuntime : IDisposable
 
         try
         {
-            ChatRecord? last = store.LastMessageUnchecked(conversationId);
-            return last != null
-                && last.Id > upToId
-                && last.SenderId.Equals(QuickChatPrincipal.Agent(petId).Id, StringComparison.OrdinalIgnoreCase);
+            return store.History(conversationId, QuickChatPrincipal.Human, limit: 100)
+                .Any(message => message.ContentType != "activity" && message.Id > upToId && message.SenderId.Equals(
+                    QuickChatPrincipal.Agent(petId).Id, StringComparison.OrdinalIgnoreCase));
         }
         catch (Exception)
         {
@@ -903,13 +1302,15 @@ public sealed class QuickChatRuntime : IDisposable
     /// <param name="conversationId">
     /// 回复落在哪个会话。默认私聊就是角色名；多开私聊是 <c>dm:小梦#2</c> 这种。
     /// </param>
-    async Task AddAssistantMessageAsync(string petId, string conversationId, ChatContext context)
+    async Task AddAssistantMessageAsync(string petId, string conversationId, ChatContext context, StreamingTurn? finishedTurn = null)
     {
         try
         {
             List<string> attachmentSources = QuickChatContentFilter.ExtractQuickChatAttachmentSources(
                 context.AIMessage, out string textWithoutAttachmentTags);
             string reply = QuickChatContentFilter.CleanAssistantText(textWithoutAttachmentTags);
+            // 思考已作为独立的过程条目保存；最终气泡只显示正文。
+            string reasoning = "";
             List<QuickChatAttachment> attachments = await ResolveQuickChatAttachmentsAsync(attachmentSources);
 
             if (string.IsNullOrWhiteSpace(reply) == false || attachments.Count > 0)
@@ -923,12 +1324,12 @@ public sealed class QuickChatRuntime : IDisposable
                     speaker,
                     reply,
                     GetConfigForPet(petId).SaveDirectMessages,
-                    GetDeliveryDepth(petId));
+                    GetDeliveryDepth(petId), reasoning);
 
                 if (record != null)
-                    AddMessage(petId, "assistant", reply, attachments, MessageIdOf(record), conversationId: conversationId);
+                    AddMessage(petId, "assistant", reply, attachments, MessageIdOf(record), conversationId: conversationId, reasoning: reasoning);
                 else
-                    AddMessage(petId, "assistant", reply, attachments, conversationId: conversationId);
+                    AddMessage(petId, "assistant", reply, attachments, conversationId: conversationId, reasoning: reasoning);
 
                 // 会话里除自己外还有别的角色（角色互相私聊）：把这条话投给对方。
                 // 只有「人类 ↔ 该角色」的单人私聊才不需要 —— 那种情况下另一端是人，推窗口就够了。
@@ -950,6 +1351,7 @@ public sealed class QuickChatRuntime : IDisposable
         }
         finally
         {
+            RemoveStreamingMessage(finishedTurn);
             // ChatFinished 表示文字回复已经结束。此时可能仍在等待 XmlFunctionCaller/GSV 语音等
             // ChatFinishedAsync 处理器，所以这里提前解除 QuickChat 的输入锁定。
             if (MarkRequestCompleted(petId))
@@ -1256,7 +1658,7 @@ public sealed class QuickChatRuntime : IDisposable
             {
                 Kind = IsImagePath(path) ? "image" : "file",
                 Path = path,
-                Name = Path.GetFileName(path),
+                Name = QuickChatLanFiles.DisplayName(path),
                 ThumbnailPath = string.Empty
             };
 
@@ -1329,6 +1731,21 @@ public sealed class QuickChatRuntime : IDisposable
                 break;
 
             case "resize":
+                // Discard measurements made before the latest conversation or width change.
+                if (!payload.TryGetProperty("conversationId", out var resizeConversation)
+                    || !string.Equals(resizeConversation.GetString(), selectedConversationId, StringComparison.Ordinal)
+                    || !payload.TryGetProperty("layoutGeneration", out var resizeGeneration)
+                    || !resizeGeneration.TryGetInt64(out long generation)
+                    || generation != System.Threading.Interlocked.Read(ref layoutGeneration))
+                    break;
+                // The browser acknowledges native layout revisions. Reject old
+                // measurements while a new native size is pending, without
+                // comparing CSS pixels to Windows DPI-scaled pixels.
+                if (window == null || !window.IsLayoutCurrent
+                    || !payload.TryGetProperty("layoutRevision", out var resizeRevision)
+                    || !resizeRevision.TryGetInt64(out long revision)
+                    || revision != window.LayoutRevision)
+                    break;
                 if (window != null && window.IsWindowDragging == false && payload.TryGetProperty("height", out System.Text.Json.JsonElement heightElement))
                 {
                     bool compact = payload.TryGetProperty("compact", out System.Text.Json.JsonElement compactElement)
@@ -1338,21 +1755,29 @@ public sealed class QuickChatRuntime : IDisposable
                         : config.MinWindowHeight;
 
                     int desiredHeight = heightElement.GetInt32();
+                    // Group chat is a room: keep its configured height unless the
+                    // user explicitly resized it. Private chat remains content-fitted.
+                    if (!compact && SelectedIsGroup)
+                        minHeight = window.SavedSize(true)?.Height ?? config.GroupWindowHeight;
 
                     // 群聊允许长得更高：自适应高度不能卡在私聊的 WindowHeight 上。
                     int maxHeight = SelectedIsGroup
                         ? Math.Max(config.GroupWindowHeight, config.WindowHeight)
                         : config.WindowHeight;
 
+                    if (maxHeight < minHeight) maxHeight = minHeight;
+
                     // 用户手动拖过就以他拖的为准：渲染层的自适应只允许往上长，不许缩回去，
                     // 上限也要抬到他拖到的高度 —— 否则「拉得比配置上限还高」会被当场压回去。
                     // 少了这一道，用户拉开一次、切个会话就被按内容重新算小，表现为「不记录窗口大小」。
                     if (compact == false && window.SavedSize(SelectedIsGroup) is { } savedSize)
                     {
-                        if (desiredHeight < savedSize.Height)
-                            desiredHeight = savedSize.Height;
-                        if (maxHeight < savedSize.Height)
-                            maxHeight = savedSize.Height;
+                        // A manual height is authoritative, including a smaller
+                        // viewport with scrolling. Content measurements must not
+                        // undo the user's drag immediately after pointer release.
+                        desiredHeight = savedSize.Height;
+                        minHeight = savedSize.Height;
+                        maxHeight = savedSize.Height;
                     }
 
                     if (compact)
@@ -2032,10 +2457,21 @@ public sealed class QuickChatRuntime : IDisposable
         string outgoing = config.MarkMessageSource ? "[消息来源(QuickChat)]" + text : text;
         string display = QuickChatContentFilter.CleanOutgoingDisplayText(outgoing, pendingPaths);
         if (string.IsNullOrWhiteSpace(display))
-            display = text;
+            display = pendingPaths.Count > 0 ? "[附件]" : text;
 
         // 附件只做本地展示；群聊投递目前只送文本，避免把图片路径糊进别人的上下文。
         List<QuickChatAttachment> attachments = BuildOutgoingAttachments(pendingPaths);
+
+        if (conversation.Id.Equals(LobbyGroupId, StringComparison.OrdinalIgnoreCase))
+        {
+            try { SendWorldBroadcast(pendingPaths.Count > 0 ? outgoing : display, null, attachments); }
+            catch (Exception exception)
+            {
+                QuickChatLog.Write("世界群聊发送失败：" + exception);
+                AddMessage(UserSpeakerId, "system", "世界群聊发送失败：" + exception.Message, conversationId: conversationId);
+            }
+            return;
+        }
 
         ChatRecord record;
         try
@@ -2057,7 +2493,13 @@ public sealed class QuickChatRuntime : IDisposable
         }
 
         AddRecordMessage(record, "user", attachments, "sent");
-        DeliverToChannels(conversation, record);
+        var delivery = record;
+        if (pendingPaths.Count > 0) delivery = new ChatRecord {
+            Id = record.Id, ConversationId = record.ConversationId, SenderId = record.SenderId,
+            SenderName = record.SenderName, Text = outgoing, SentAt = record.SentAt, Depth = record.Depth,
+            ContentType = record.ContentType, Mentions = record.Mentions
+        };
+        DeliverToChannels(conversation, delivery);
         await Task.CompletedTask;
     }
 
@@ -2072,22 +2514,38 @@ public sealed class QuickChatRuntime : IDisposable
             id: MessageIdOf(record),
             deliveryState: deliveryState,
             conversationId: record.ConversationId,
-            senderName: record.SenderName);
+            senderName: record.SenderName,
+            reasoning: record.Reasoning);
     }
 
     /// <summary>落盘记录 → 前端 DTO。</summary>
     QuickChatMessage ToDisplayMessage(ChatRecord record)
     {
+        bool boardMessage = record.ContentType == "activity" && record.ActivityTitle == "系统或外部消息"
+            && QuickChatContentFilter.TryExtractChatWindowText(record.Text, out _);
+        string boardText = "";
+        if (boardMessage) QuickChatContentFilter.TryExtractChatWindowText(record.Text, out boardText);
+        string activityTitle = record.ActivityTitle;
+        string activityKind = string.IsNullOrEmpty(record.ActivityKind) ? "process" : record.ActivityKind;
+        if (!boardMessage && record.ContentType == "activity" && record.ActivityTitle == "系统或外部消息")
+        {
+            var items = QuickChatContentFilter.ClassifyIncomingActivities(record.Text);
+            activityKind = items.Count > 0 && items.All(item => item.Kind == "system_event") ? "system_event" : "process";
+            activityTitle = string.Join(" / ", items.Select(item => item.Title).Distinct());
+        }
         return new QuickChatMessage
         {
             Id = MessageIdOf(record),
-            Role = record.Sender.IsHuman ? "user" : record.Sender.IsSystem ? "system" : "assistant",
-            PetId = PetIdOf(record.Sender),
+            Role = boardMessage ? "user" : record.ContentType == "activity" ? "activity" : record.Sender.IsHuman ? "user" : record.Sender.IsSystem ? "system" : "assistant",
+            PetId = boardMessage ? UserSpeakerId : record.ContentType == "activity" && !string.IsNullOrEmpty(record.ActivityActorId) ? record.ActivityActorId : PetIdOf(record.Sender),
             PetName = record.SenderName,
             SenderName = record.SenderName,
             ConversationId = record.ConversationId,
             Kind = IsGroupConversationId(record.ConversationId) ? "group" : "dm",
-            Text = record.Text,
+            Text = boardMessage ? boardText : record.Text,
+            Reasoning = record.Reasoning,
+            ActivityTitle = activityTitle,
+            ActivityKind = activityKind,
             CreatedAt = record.SentAt
         };
     }
@@ -2116,7 +2574,7 @@ public sealed class QuickChatRuntime : IDisposable
     /// 否则两个角色会互相刷屏。
     /// </param>
     ChatRecord? TryPersistDirectMessage(
-        string conversationId, QuickChatPrincipal sender, string text, bool persist, int depth = 0)
+        string conversationId, QuickChatPrincipal sender, string text, bool persist, int depth = 0, string? reasoning = null)
     {
         if (store == null || string.IsNullOrWhiteSpace(text))
             return null;
@@ -2126,7 +2584,7 @@ public sealed class QuickChatRuntime : IDisposable
             if (store.Find(conversationId) == null)
                 return null;
 
-            return store.Send(conversationId, sender, text, depth, "text", persist);
+            return store.Send(conversationId, sender, text, depth, "text", persist, reasoning);
         }
         catch (Exception exception)
         {
@@ -2178,6 +2636,12 @@ public sealed class QuickChatRuntime : IDisposable
         // 「她跟别人私聊，话却发到了上一次翻过的会话里」。
         // QuickChatDirect 最终也走到这里，所以两条发送路径都覆盖到了。
         ClearToolReplyTarget(petId);
+
+        if (conversation.Id.Equals(LobbyGroupId, StringComparison.OrdinalIgnoreCase))
+        {
+            SendWorldBroadcast(text, petId);
+            return;
+        }
 
         int depth = GetDeliveryDepth(petId);
         bool persist = conversation.IsGroup ? config.SaveGroupMessages : config.SaveDirectMessages;
@@ -2858,7 +3322,10 @@ public sealed class QuickChatRuntime : IDisposable
         string? id = null,
         string? deliveryState = null,
         string? conversationId = null,
-        string? senderName = null)
+        string? senderName = null,
+        string? reasoning = null,
+        string? activityTitle = null,
+        string? activityKind = null)
     {
         ChatActivity? activity = chatActivitySystem.GetAllChatActivities()
             .FirstOrDefault(item => item.Character.Name == petId);
@@ -2878,6 +3345,9 @@ public sealed class QuickChatRuntime : IDisposable
             ConversationId = key,
             Kind = IsGroupConversationId(key) ? "group" : "dm",
             Text = text,
+            Reasoning = reasoning ?? "",
+            ActivityTitle = activityTitle ?? "",
+            ActivityKind = activityKind ?? (role == "activity" ? "process" : ""),
             DeliveryState = deliveryState ?? string.Empty,
             Attachments = attachments?.Where(item => string.IsNullOrWhiteSpace(item.Path) == false).ToList() ?? new(),
             CreatedAt = DateTimeOffset.Now
@@ -2926,6 +3396,8 @@ public sealed class QuickChatRuntime : IDisposable
             // 书签栏只放群聊（含公共大厅）；下方的「会话记录」由前端按聊过的会话自动排。
             groups = conversations.Where(item => item.Kind == "group").ToList(),
             selectedId = selected,
+            layoutGeneration = System.Threading.Interlocked.Read(ref layoutGeneration),
+            layoutRevision = window?.LayoutRevision ?? 0,
             groupMode = IsGroupConversationId(selected),
             enableGroupChat = config.EnableGroupChat,
             sidebarExpandOnHover = config.SidebarExpandOnHover,
@@ -2939,11 +3411,13 @@ public sealed class QuickChatRuntime : IDisposable
             maxVisibleMessages = config.MaxVisibleMessages,
             showAllMessages = config.ShowAllMessages,
             hideOnEscape = config.HideOnEscape,
+            simpleMode = config.SimpleMode,
             autoHeight = config.AutoFitHeight,
             minWindowHeight = config.MinWindowHeight,
             maxWindowHeight = config.WindowHeight,
             theme = new
             {
+                style = config.ThemeStyle.ToString(),
                 panelColor = config.PanelColor,
                 panelOpacity = config.PanelOpacity,
                 dragBackdropBlur = config.DragBackdropBlur,
@@ -3308,9 +3782,11 @@ public sealed class QuickChatRuntime : IDisposable
         if (string.IsNullOrWhiteSpace(conversationId))
             return;
 
+        if (!string.Equals(selectedConversationId, conversationId, StringComparison.Ordinal))
+            System.Threading.Interlocked.Increment(ref layoutGeneration);
         selectedConversationId = conversationId;
-        SendState();
         ApplyConversationWindowSize();
+        SendState();
         SendSelectedHistory();
     }
 
@@ -3322,10 +3798,12 @@ public sealed class QuickChatRuntime : IDisposable
     /// 同一个模板反复新建会依次拿到 #2、#3……
     /// </para>
     /// </summary>
-    void CreateConversation(string? sourceConversationId)
+    void CreateConversation(string? sourceConversationId) => CreateConversationCore(sourceConversationId, true);
+
+    string? CreateConversationCore(string? sourceConversationId, bool selectOnDesktop)
     {
         if (store == null)
-            return;
+            return null;
 
         string? sourceId = string.IsNullOrWhiteSpace(sourceConversationId)
             ? selectedConversationId
@@ -3336,7 +3814,7 @@ public sealed class QuickChatRuntime : IDisposable
         {
             if (string.IsNullOrWhiteSpace(sourceId) == false)
                 AddSystemMessage(sourceId, "这个会话已经不在了，无法新建。", sourceId);
-            return;
+            return null;
         }
 
         bool isGroup = source.IsGroup;
@@ -3356,7 +3834,7 @@ public sealed class QuickChatRuntime : IDisposable
         }
 
         if (string.IsNullOrEmpty(id))
-            return;
+            return null;
 
         try
         {
@@ -3370,14 +3848,14 @@ public sealed class QuickChatRuntime : IDisposable
         catch (Exception exception)
         {
             QuickChatLog.Write("新建会话失败：" + exception.Message);
-            return;
+            return null;
         }
 
-        selectedConversationId = id;
+        if (selectOnDesktop) selectedConversationId = id;
         RefreshAllPrompts();
         SendState();
-        SendSelectedHistory();
-        ApplyConversationWindowSize();
+        if (selectOnDesktop) { SendSelectedHistory(); ApplyConversationWindowSize(); }
+        return id;
     }
 
     /// <summary>把「小群A (2)」这样的复制后缀剥掉，拿到原始标题；没有后缀就原样返回。</summary>
@@ -3731,40 +4209,15 @@ public sealed class QuickChatRuntime : IDisposable
     /// </summary>
     void ApplyConversationWindowSize()
     {
-        if (window == null)
-            return;
-
-        int sidebar = config.EnableGroupChat ? QuickChatConfig.SidebarRailWidth : 0;
-        QuickChatWindowSize? saved = window.SavedSize(SelectedIsGroup);
-
-        if (SelectedIsGroup)
-        {
-            int groupWidth = Math.Max(config.GroupWindowWidth, config.WindowWidth) + sidebar;
-            int groupHeight = Math.Max(config.GroupWindowHeight, config.MinWindowHeight);
-            if (saved is { } group)
-            {
-                groupWidth = group.Width + sidebar;
-                groupHeight = group.Height;
-            }
-
-            window.SetSize(groupWidth, groupHeight);
-            return;
-        }
-
-        // 私聊：只纠正宽度。
-        // 高度归渲染层所有 —— 它按当前会话的消息内容自适应上报。这里如果按 MinWindowHeight
-        // 把高度一起写掉，而渲染层在消息没变时不会重新上报（renderMessages 的签名去重会提前
-        // return），窗口就会被永久钉在最小高度上，表现为「每次呼出都缩成一条，得手动拉高」。
-        if (config.AutoFitHeight)
-        {
-            window.SetWidth(saved is { } direct ? direct.Width : config.EffectiveWindowWidth);
-            return;
-        }
-
-        // 关闭自适应时高度是固定的，渲染层不会上报，只能由后端设定。
-        window.SetSize(
-            saved is { } directSize ? directSize.Width : config.EffectiveWindowWidth,
-            saved is { } directHeight ? directHeight.Height : config.WindowHeight);
+        if (window == null) return;
+        var saved = window.SavedSize(SelectedIsGroup);
+        int chatWidth = SelectedIsGroup ? Math.Max(config.GroupWindowWidth, config.WindowWidth) : config.WindowWidth;
+        int width = saved?.Width ?? QuickChatWindowGeometry.DefaultBaseWidth(chatWidth,
+            config.EnableGroupChat, QuickChatConfig.SidebarRailWidth);
+        int height = saved?.Height ?? (SelectedIsGroup ? config.GroupWindowHeight : config.WindowHeight);
+        // Restore the target mode's complete base size. The renderer remeasures
+        // at that width after window-layout; the previous mode's height is never reused.
+        window.SetSize(width, Math.Max(config.MinWindowHeight, height));
     }
 
     // ────────────────────────── 窗口 ──────────────────────────
@@ -3791,7 +4244,6 @@ public sealed class QuickChatRuntime : IDisposable
         {
             EnsureSelectedConversation();
             await EnsureWindow().ShowAsync(config, ResolveWwwRoot(), SelectedIsGroup);
-            ApplyConversationWindowSize();
             SendState();
             SendSelectedHistory();
         }
@@ -3828,10 +4280,11 @@ public sealed class QuickChatRuntime : IDisposable
     static string CreateConfigSignature(QuickChatConfig value)
     {
         return string.Join("|", value.Hotkeys)
+            + $"|{value.LanEnabled}|{value.LanPort}|{value.SimpleMode}"
             + $"|{value.WindowWidth}|{value.WindowHeight}"
             + $"|{value.MaxVisibleMessages}|{value.ShowAllMessages}|{value.HideOnEscape}|{value.MarkMessageSource}"
             + $"|{value.ScreenshotImageMode}"
-            + $"|{value.AutoFitHeight}|{value.MinWindowHeight}|{value.ColorPreset}"
+            + $"|{value.AutoFitHeight}|{value.MinWindowHeight}|{value.ColorPreset}|{value.ThemeStyle}"
             + $"|{value.PanelColor}|{value.PanelOpacity:R}"
             + $"|{value.DragBackdropBlur:R}"
             + $"|{value.MessageListColor}|{value.MessageListOpacity:R}"
@@ -3878,7 +4331,6 @@ public sealed class QuickChatRuntime : IDisposable
             window.OnMessage -= OnRendererMessage;
             window.OnMessage += OnRendererMessage;
             await window.ToggleAtMouseAsync(config, wwwRoot, SelectedIsGroup);
-            ApplyConversationWindowSize();
         }
         catch (Exception exception)
         {
@@ -3899,6 +4351,9 @@ public sealed class QuickChatRuntime : IDisposable
 
         QuickChatConfig normalized = new QuickChatConfig
         {
+            SimpleMode = value.SimpleMode,
+            LanEnabled = value.LanEnabled,
+            LanPort = Math.Clamp(value.LanPort, 1024, 65535),
             Hotkeys = hotkeys,
             WindowWidth = Math.Clamp(value.WindowWidth == 380 ? 320 : value.WindowWidth, 260, 1000),
             WindowHeight = Math.Clamp(value.WindowHeight == 520 ? 460 : value.WindowHeight, 120, 1200),
@@ -3906,6 +4361,7 @@ public sealed class QuickChatRuntime : IDisposable
             ShowAllMessages = value.ShowAllMessages,
             AutoFitHeight = value.AutoFitHeight,
             MinWindowHeight = Math.Clamp(value.MinWindowHeight == 170 ? 96 : value.MinWindowHeight, 52, 1000),
+            ThemeStyle = Enum.IsDefined(value.ThemeStyle) ? value.ThemeStyle : QuickChatTheme.默认主题,
             ColorPreset = string.IsNullOrWhiteSpace(value.ColorPreset) ? "自定义" : value.ColorPreset.Trim(),
             HideOnEscape = value.HideOnEscape,
             MarkMessageSource = value.MarkMessageSource,
@@ -4138,6 +4594,15 @@ public sealed class QuickChatRuntime : IDisposable
             return;
 
         disposed = true;
+        _ = ConfigureLanAsync();
+        lock (worldGate)
+        {
+            if (worldEvent != null && worldHandler != null)
+                worldEvent.RemoveEventHandler(null, worldHandler);
+            worldEvent = null;
+            worldHandler = null;
+            worldServiceType = null;
+        }
         chatActivitySystem.Activated -= OnChatActivityActivated;
         chatActivitySystem.Deactivated -= OnChatActivityDeactivated;
 
@@ -4146,12 +4611,20 @@ public sealed class QuickChatRuntime : IDisposable
 
         lock (stateGate)
         {
+            foreach (var observer in toolObservers.Values)
+            {
+                observer.Executor.Handling -= observer.Handling;
+                observer.Executor.Error -= observer.Error;
+            }
+            toolObservers.Clear();
             foreach (QuickChatChannel channel in channels.Values.ToList())
                 channel.Dispose();
             channels.Clear();
             deliveryDepths.Clear();
             pendingReplies.Clear();
             streamingTurns.Clear();
+            lastTurnReasoning.Clear();
+            processConversationByPet.Clear();
             toolReplyTargets.Clear();
         }
 
@@ -4299,6 +4772,9 @@ public class QuickChatMessage
     public string SenderName { get; set; } = string.Empty;
 
     public string Text { get; set; } = string.Empty;
+    public string Reasoning { get; set; } = string.Empty;
+    public string ActivityTitle { get; set; } = string.Empty;
+    public string ActivityKind { get; set; } = string.Empty;
 
     /// <summary>用户消息的送达状态：空（不适用）/ sending / sent / failed。</summary>
     public string DeliveryState { get; set; } = string.Empty;

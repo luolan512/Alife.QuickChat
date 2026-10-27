@@ -11,6 +11,46 @@ namespace Marisa.QuickChat;
 /// </summary>
 public static class QuickChatContentFilter
 {
+    public sealed record IncomingActivity(string Title, string Text, string Kind);
+
+    public static IReadOnlyList<IncomingActivity> ClassifyIncomingActivities(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return Array.Empty<IncomingActivity>();
+        MatchCollection sources = Regex.Matches(raw,
+            @"\[(?:源|消息来源)\((?<source>[^)\]]+)\)\]|消息来源\s*[:：]\s*\[(?<source>[^\]]+)\]",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (sources.Count == 0)
+            return new[] { new IncomingActivity("外部输入", raw, "process") };
+
+        List<IncomingActivity> result = new();
+        for (int index = 0; index < sources.Count; index++)
+        {
+            Match source = sources[index];
+            int end = index + 1 < sources.Count ? sources[index + 1].Index : raw.Length;
+            string text = raw.Substring(source.Index, end - source.Index).Trim();
+            string name = source.Groups["source"].Value.Trim();
+            bool proactive = name.Equals("SystemEventService", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("SystemEventBoostService", StringComparison.OrdinalIgnoreCase)
+                || (name.Equals("TimedTaskService", StringComparison.OrdinalIgnoreCase)
+                    && Regex.IsMatch(text, @"AWake\s*报点\s*[:：]", RegexOptions.IgnoreCase));
+            bool feedback = name.Equals("MessageFilterService", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("XmlFunctionCaller", StringComparison.OrdinalIgnoreCase);
+            string title = proactive ? "系统主动事件" : feedback ? "工具反馈 · " + name : "工具或插件返回 · " + name;
+            result.Add(new IncomingActivity(title, text, proactive ? "system_event" : "process"));
+        }
+        return result;
+    }
+    public static bool TryExtractChatWindowText(string? raw, out string text)
+    {
+        text = "";
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        Match source = Regex.Match(raw,
+            @"\A\s*(?:当前时间\s*[:：]\s*\[[^\]]+\]\s*)?(?:\[\s*源\s*\(\s*ChatWindow\s*\)\s*\]|\[\s*消息来源\s*\(\s*ChatWindow\s*\)\s*\]|消息来源\s*[:：]\s*\[\s*ChatWindow\s*\])",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (!source.Success) return false;
+        text = CleanOutgoingDisplayText(raw.Substring(source.Length), Array.Empty<string>());
+        return !string.IsNullOrWhiteSpace(text);
+    }
     public static string CleanUserText(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -292,6 +332,16 @@ public static class QuickChatContentFilter
         return text.Trim();
     }
 
+    public static string ExtractThoughtText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var parts = Regex.Matches(raw,
+            @"<\s*(?:think|thinking|reasoning)\b[^>]*>([\s\S]*?)<\s*/\s*(?:think|thinking|reasoning)\s*>|<!--([\s\S]*?)-->",
+            RegexOptions.IgnoreCase);
+        return string.Join("\n", parts.Select(m => WebUtility.HtmlDecode(
+            (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value).Trim())).Where(s => s.Length > 0));
+    }
+
     /// <summary>附件标记只剩开标签时的样子（闭标签还没流到）。</summary>
     static readonly Regex UnclosedAttachmentMarkerRegex = new(
         @"\[{2}\s*\[?\s*QuickChat(?:Attachment|Image|File)\s*\]*\s*\]{2}",
@@ -317,6 +367,22 @@ public static class QuickChatContentFilter
 
         // 完整的附件标记先摘掉；摘不掉的（只有开标签）在下面按「未闭合」截断。
         ExtractQuickChatAttachmentSources(raw, out string withoutAttachments);
+        int openComment = withoutAttachments.LastIndexOf("<!--", StringComparison.Ordinal);
+        if (openComment >= 0 && withoutAttachments.IndexOf("-->", openComment, StringComparison.Ordinal) < 0)
+            withoutAttachments = withoutAttachments.Substring(0, openComment);
+
+        // 非 Speak 的 XML 可能跨多个分片；在闭标签到来之前，内容也属于工具或思考，不能显示。
+        MatchCollection openTags = Regex.Matches(withoutAttachments,
+            @"<\s*(?!speak\b)([A-Za-z_][\w:.-]*)\b[^>]*?(?<!/)>" , RegexOptions.IgnoreCase);
+        foreach (Match tag in openTags)
+        {
+            string closePattern = @"<\s*/\s*" + Regex.Escape(tag.Groups[1].Value) + @"\s*>";
+            if (!Regex.IsMatch(withoutAttachments.Substring(tag.Index + tag.Length), closePattern, RegexOptions.IgnoreCase))
+            {
+                withoutAttachments = withoutAttachments.Substring(0, tag.Index);
+                break;
+            }
+        }
         string text = CleanAssistantText(withoutAttachments);
 
         // 附件标记的开标签已经到齐、闭标签还没到：从这里往后全是路径，整段丢掉。
@@ -327,6 +393,7 @@ public static class QuickChatContentFilter
         // 标签 / 标记只流了一半（`<QuickChat`、`[[QuickCha`）：
         // 完整正则都匹配不上，留着就会把半截源码显示出来。
         text = Regex.Replace(text, @"<[A-Za-z_/!?][^>\n]*$", string.Empty);
+        text = Regex.Replace(text, @"<$", string.Empty);
         text = Regex.Replace(text, @"\[{2,}[^\]\n]*$", string.Empty);
 
         return text.TrimEnd();
